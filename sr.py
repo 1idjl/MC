@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """
-45S5/Sr Bioglass NVT Monte Carlo - Enhanced Version v8.1
+45S5/Sr Bioglass NVT Monte Carlo - Enhanced Version v8.2
 Based on: Xiang & Du, Chem. Mater. 2011, 23, 2703-2717
 
-New in v8.1:
-- Added --continue mode to deeply relax already-equilibrated structures 
-  (skips melting/annealing, performs short healing + long production).
-- Cyclic annealing protocol to escape local minima.
-- Enhanced oxygen displacement at high temperatures to reduce FO.
-- Improved auto-cutoff detection for accurate CN.
+New in v8.2:
+- Increased O-O r_hard from 1.4 to 1.8 to prevent O-O close contacts
+- Increased O-O Buckingham A from 2029 to 5000 for stronger repulsion
+- Repulsive Buckingham terms for Si-Si, Si-P, P-P to prevent unphysical bonds
+- Hard geometric constraint (_check_nf_geometry) to prevent NF-NF close contacts
+- Support for 11340-atom systems (4x base cell)
+- Continue mode for deep relaxation of pre-equilibrated structures
+- Cyclic annealing protocol to escape local minima
+- Enhanced oxygen displacement at high temperatures to reduce FO
+- Improved auto-cutoff detection with pair-specific RMIN values
+- Pair-specific minimum distance enforcement
+
+Usage:
+  python Sr.py initial_Sr0.xyz --final-sweeps 150 --cores 8
+  python Sr.py Bioglass_x0_N11340_seed42/final_structure.xyz --continue --final-sweeps 300 --cores 8
 """
 
 import numpy as np
@@ -95,6 +104,11 @@ class FileError(SimulationError):
 
 
 def parse_xyz_header(path: Path):
+    """
+    Parse first two lines of XYZ.
+    Expected comment format:
+    Xiang-Du 2011, x=0 mol% SrO, N=11340, rho=2.6490 g/cm3, box=53.6530 A, seed=42
+    """
     if not path.exists():
         raise FileError(f"File not found: {path}")
 
@@ -149,8 +163,8 @@ class SimulationConfig:
     x: int = 0
     box_override: Optional[float] = None
     output_dir: Optional[Path] = None
-    
-    # NEW: Continue mode flag
+
+    # Continue mode flag
     continue_mode: bool = False
 
     # MC schedule in sweeps (1 sweep = N atom move attempts)
@@ -169,7 +183,7 @@ class SimulationConfig:
     healing_temp: float = 2500.0
     healing_sweeps: int = 5
 
-    low_t_sweeps: int = 8  
+    low_t_sweeps: int = 8
     final_sweeps: int = 30
 
     snapshot_interval: Optional[int] = None
@@ -216,26 +230,31 @@ class Potential:
         self.buck_params = {
             ('Si', 'O'): {'A': 13702.905,  'F': 0.193817, 'C': 54.681},
             ('P',  'O'): {'A': 26655.472,  'F': 0.181968, 'C': 86.856},
-            ('O',  'O'): {'A': 2029.2204,  'F': 0.343645, 'C': 192.58},
+            # O-O: Increased A from 2029 to 5000 for stronger short-range repulsion
+            ('O',  'O'): {'A': 5000.0,     'F': 0.25,     'C': 192.58},
             ('Na', 'O'): {'A': 4383.7555,  'F': 0.243838, 'C': 30.70},
             ('Ca', 'O'): {'A': 7747.1834,  'F': 0.252623, 'C': 93.109},
             ('Sr', 'O'): {'A': 14566.637,  'F': 0.245015, 'C': 81.773},
-            # ===== NEW: Repulsive terms to prevent Si-Si, Si-P, P-P bonds =====
+            # NEW: Repulsive terms to prevent Si-Si, Si-P, P-P bonds
             ('Si', 'Si'): {'A': 3000.0, 'F': 0.30, 'C': 0.0},
             ('Si', 'P'):  {'A': 3000.0, 'F': 0.30, 'C': 0.0},
             ('P',  'P'):  {'A': 3000.0, 'F': 0.30, 'C': 0.0},
         }
 
         self.r_hard_default = 0.9
-        # ===== UPDATED: Larger r_hard for network former pairs =====
+
+        # UPDATED r_hard values:
+        # O-O increased from 1.4 to 1.8 to prevent O-O close contacts
+        # Si-Si, Si-P, P-P set to 2.0 to prevent NF-NF bonds
         self.r_hard_by_pair = {
-            ('O', 'O'): 1.4,
-            ('Si', 'Si'): 2.0,   # Prevent Si-Si bonds
-            ('Si', 'P'): 2.0,    # Prevent Si-P close contact
-            ('P',  'P'): 2.0,    # Prevent P-P close contact
+            ('O', 'O'): 1.8,    # Increased from 1.4 - prevents O-O bonds
+            ('Si', 'Si'): 2.0,  # Prevents Si-Si bonds
+            ('Si', 'P'): 2.0,   # Prevents Si-P close contact
+            ('P',  'P'): 2.0,   # Prevents P-P close contact
         }
 
         self.sbs_x_o = {'Ca': 32.0, 'Na': 20.0, 'Sr': 32.0}
+
 
 # =========================
 # GLASS SYSTEM
@@ -329,8 +348,8 @@ class GlassSystem:
                         f"provided density {self.config.density:.4f}. Using box from XYZ."
                     )
             logger.info(
-                f"Using box from XYZ: {self.box:.4f} Å "
-                f"(density = {self.effective_density:.4f} g/cm³)"
+                f"Using box from XYZ: {self.box:.4f} A "
+                f"(density = {self.effective_density:.4f} g/cm3)"
             )
 
         elif self.config.density is not None:
@@ -338,8 +357,8 @@ class GlassSystem:
             volume_A3 = (self.total_mass / NA) / self.effective_density * 1.0e24
             self.box = volume_A3 ** (1.0 / 3.0)
             logger.info(
-                f"Using density {self.effective_density:.4f} g/cm³ "
-                f"to set box = {self.box:.4f} Å"
+                f"Using density {self.effective_density:.4f} g/cm3 "
+                f"to set box = {self.box:.4f} A"
             )
 
         else:
@@ -719,7 +738,6 @@ class MCSimulator:
 
         self.tracker = {'need_rebuild': False}
 
-        # Enhanced max_disp - larger for oxygen at high temperatures
         self.max_disp = {
             'Si': 0.04, 'Ca': 0.08, 'Na': 0.08,
             'P': 0.05, 'O': 0.08, 'Sr': 0.08
@@ -887,6 +905,48 @@ class MCSimulator:
             self.short_log.append(self.current_short / self.system.N_ATOMS)
             self.coul_log.append(self.current_coul / self.system.N_ATOMS)
 
+    def _check_nf_geometry(self, idx):
+        """
+        Hard constraint: Prevent unphysical Si-Si, Si-P, P-P close contacts.
+        This check is performed BEFORE energy calculation for efficiency.
+        Returns True if geometry is valid, False otherwise.
+        """
+        ti = self.system.type_indices[idx]
+
+        # Only check for network formers (Si=0, P=3)
+        if ti not in (0, 3):
+            return True
+
+        xi, yi, zi = self.system.coords[idx]
+        box = self.system.box
+        neigh, st = self.nl.neighbors, self.nl.starts
+
+        # Minimum allowed distance between network formers (Angstrom)
+        MIN_NF_DIST_SQ = 2.5 ** 2  # 6.25 A^2
+
+        for p in range(st[idx], st[idx + 1]):
+            j = neigh[p]
+            tj = self.system.type_indices[j]
+
+            # Only check against other network formers
+            if tj not in (0, 3):
+                continue
+
+            dx = xi - self.system.coords[j, 0]
+            dy = yi - self.system.coords[j, 1]
+            dz = zi - self.system.coords[j, 2]
+
+            dx -= box * round(dx / box)
+            dy -= box * round(dy / box)
+            dz -= box * round(dz / box)
+
+            r2 = dx * dx + dy * dy + dz * dz
+
+            if r2 < MIN_NF_DIST_SQ:
+                return False
+
+        return True
+
     def _mc_move(self, T: float) -> bool:
         n = self.system.N_ATOMS
         i = int(self.rng.integers(0, n))
@@ -909,12 +969,11 @@ class MCSimulator:
         delta = self.rng.uniform(-maxd, maxd, size=3)
         self.system.coords[i] = (old_pos + delta) % self.system.box
 
-        # ===== NEW: Hard geometric constraint for network formers =====
+        # Hard geometric constraint for network formers
         # This prevents Si-Si, Si-P, P-P bonds BEFORE energy calculation
         if not self._check_nf_geometry(i):
             self.system.coords[i] = old_pos
             return False
-        # ================================================================
 
         new_e = local_energy(
             i, self.system.coords, self.system.charges, self.system.type_indices,
@@ -976,7 +1035,7 @@ class MCSimulator:
         self.current_short = sr
         self.current_coul = cl + self.wolf_self
 
-    def _run_stage(self, T: float, steps: int, desc: str, adaptive: bool = False, 
+    def _run_stage(self, T: float, steps: int, desc: str, adaptive: bool = False,
                    mixing: bool = False, enhance_oxygen: bool = False):
         logger.info(f"{desc}: T={T:.1f} K, steps={steps}")
 
@@ -988,17 +1047,14 @@ class MCSimulator:
 
         ema = 0.5
 
-        # Store original max_disp
         orig_disp = self.max_disp.copy()
 
         if mixing:
             for k in self.max_disp:
                 self.max_disp[k] *= 2.0
-            # Extra boost for oxygen during mixing
             self.max_disp['O'] *= 1.5
 
         if enhance_oxygen and T >= 1500.0:
-            # Increase oxygen displacement at high temperatures to help escape FO states
             self.max_disp['O'] = min(self.max_disp['O'] * 1.3, 0.20)
 
         pbar = tqdm(range(steps), desc=f"T={T:.0f}K")
@@ -1042,51 +1098,10 @@ class MCSimulator:
 
         pbar.close()
 
-        # Restore original max_disp
         self.max_disp = orig_disp
 
         logger.info(f"  Stage acceptance: {stage_acc / max(1, stage_att) * 100:.2f}%")
-    def _check_nf_geometry(self, idx):
-        """
-        Hard constraint: Prevent unphysical Si-Si, Si-P, P-P close contacts.
-        This check is performed BEFORE energy calculation for efficiency.
-        Returns True if geometry is valid, False otherwise.
-        """
-        ti = self.system.type_indices[idx]
-        
-        # Only check for network formers (Si=0, P=3)
-        if ti not in (0, 3):
-            return True
-        
-        xi, yi, zi = self.system.coords[idx]
-        box = self.system.box
-        neigh, st = self.nl.neighbors, self.nl.starts
-        
-        # Minimum allowed distance between network formers (Å)
-        MIN_NF_DIST_SQ = 2.5 ** 2  # 6.25 Å²
-        
-        for p in range(st[idx], st[idx + 1]):
-            j = neigh[p]
-            tj = self.system.type_indices[j]
-            
-            # Only check against other network formers
-            if tj not in (0, 3):
-                continue
-            
-            dx = xi - self.system.coords[j, 0]
-            dy = yi - self.system.coords[j, 1]
-            dz = zi - self.system.coords[j, 2]
-            
-            dx -= box * round(dx / box)
-            dy -= box * round(dy / box)
-            dz -= box * round(dz / box)
-            
-            r2 = dx * dx + dy * dy + dz * dz
-            
-            if r2 < MIN_NF_DIST_SQ:
-                return False
-        
-        return True
+
     def run(self):
         logger.info("=" * 70)
         logger.info(f"STARTING NVT MONTE CARLO - x={self.config.x} mol% SrO")
@@ -1095,43 +1110,35 @@ class MCSimulator:
         logger.info("=" * 70)
 
         if self.config.continue_mode:
-            # ================================
             # CONTINUE MODE PROTOCOL
-            # ================================
-            # 1. Short healing to break residual bad bonds (like FO)
             logger.info("Performing short healing on the input structure...")
             self._run_stage(
-                2500.0, 
-                max(1, int(3 * self.system.N_ATOMS)), 
-                "Short Healing", 
-                adaptive=True, 
+                2500.0,
+                max(1, int(3 * self.system.N_ATOMS)),
+                "Short Healing",
+                adaptive=True,
                 enhance_oxygen=True
             )
-            
-            # 2. Cool down
+
             self._run_stage(
-                1500.0, 
-                max(1, int(2 * self.system.N_ATOMS)), 
-                "Cool down 1", 
+                1500.0,
+                max(1, int(2 * self.system.N_ATOMS)),
+                "Cool down 1",
                 adaptive=True
             )
             self._run_stage(
-                800.0, 
-                max(1, int(2 * self.system.N_ATOMS)), 
-                "Cool down 2", 
+                800.0,
+                max(1, int(2 * self.system.N_ATOMS)),
+                "Cool down 2",
                 adaptive=True
             )
 
-            # 3. Low-T relaxation
             for k in self.max_disp:
                 self.max_disp[k] *= 0.5
             self._run_stage(1.0, self.low_t_steps, "Low-T relaxation", adaptive=False)
 
         else:
-            # ================================
-            # FULL PROTOCOL (Original)
-            # ================================
-            # High-temperature mixing with enhanced oxygen mobility
+            # FULL PROTOCOL
             self._run_stage(
                 self.config.mixing_temp,
                 self.mixing_steps,
@@ -1141,15 +1148,12 @@ class MCSimulator:
                 enhance_oxygen=True
             )
 
-            # Cyclic annealing with enhanced oxygen mobility at high temperatures
             for i, (T, steps) in enumerate(self.annealing_stages):
                 self._run_stage(T, steps, f"Annealing {i + 1}", adaptive=True, enhance_oxygen=True)
 
-            # Reduce displacements before healing
             for k in self.max_disp:
                 self.max_disp[k] *= 0.7
 
-            # Defect healing stage - helps eliminate remaining FO
             logger.info(f"Defect Healing: T={self.config.healing_temp:.1f} K")
             self._run_stage(
                 self.config.healing_temp,
@@ -1159,22 +1163,17 @@ class MCSimulator:
                 enhance_oxygen=True
             )
 
-            # Cool down again after healing
-            self._run_stage(1000.0, max(1, int(3 * self.system.N_ATOMS)), 
+            self._run_stage(1000.0, max(1, int(3 * self.system.N_ATOMS)),
                            "Cool after healing", adaptive=True)
-            self._run_stage(600.0, max(1, int(2 * self.system.N_ATOMS)), 
+            self._run_stage(600.0, max(1, int(2 * self.system.N_ATOMS)),
                            "Cool after healing", adaptive=True)
 
-            # Extended low-T relaxation
             for k in self.max_disp:
                 self.max_disp[k] *= 0.5
 
             self._run_stage(1.0, self.low_t_steps, "Low-T relaxation", adaptive=False)
 
-        # ================================
-        # PRODUCTION (Common for both modes)
-        # ================================
-        # Prepare for production
+        # PRODUCTION
         for k in self.max_disp:
             self.max_disp[k] = min(max(self.max_disp[k] * 0.8, 0.02), 0.15)
 
@@ -1250,10 +1249,10 @@ class Analyzer:
             ('Na', 'Sr'): 4.40
         }
 
-        # Improved rmin values for each pair to avoid false minima
+        # Pair-specific RMIN values for auto-cutoff detection
         self.RMIN_VALUES = {
             ('Si', 'O'): 1.4,
-            ('P', 'O'): 1.3,      # Reduced from 1.2 to avoid false minimum
+            ('P', 'O'): 1.3,
             ('Na', 'O'): 2.0,
             ('Ca', 'O'): 2.0,
             ('Sr', 'O'): 2.2,
@@ -1315,9 +1314,6 @@ class Analyzer:
         self.si_o_cut_extra = [2.15, 2.20, 2.25, 2.30, 2.35]
 
     def _find_first_minimum(self, r, gr, pair, rmin=None, rmax=4.0):
-        """
-        Improved first minimum finder with pair-specific rmin values.
-        """
         if rmin is None:
             rmin = self.RMIN_VALUES.get(pair, 1.5)
 
@@ -1332,7 +1328,6 @@ class Analyzer:
         if len(r_masked) < 3:
             return None
 
-        # Smooth the g(r) to avoid noise-induced false minima
         gr_smooth = gaussian_filter1d(gr_masked, sigma=2.0)
 
         diff = np.diff(gr_smooth)
@@ -1388,7 +1383,6 @@ class Analyzer:
             except Exception:
                 pass
 
-        # Fallback manual RDF
         if ni <= nj:
             small_idx = np.where(mi)[0]
             large_coords = coords[mj]
@@ -1784,7 +1778,6 @@ class Analyzer:
 
             rxx[elem] = CN / denom if denom > 0 else 0.0
 
-        # Modifier preference ratios
         modifier_preference = {}
 
         for A in ['Si', 'P']:
@@ -2068,7 +2061,7 @@ class Analyzer:
             ax = axes[idx]
 
             ax.plot(r_cn, cn, color='#2980b9', linewidth=1.5)
-            ax.set_xlabel('r (Å)')
+            ax.set_xlabel('r (A)')
             ax.set_ylabel('CN(r)')
             ax.set_title(pair)
             ax.grid(True, alpha=0.3)
@@ -2086,7 +2079,7 @@ class Analyzer:
                         x=cut,
                         color='#e74c3c',
                         linestyle='--',
-                        label=f'Cutoff = {cut:.2f} Å, CN = {cn_cut:.2f}'
+                        label=f'Cutoff = {cut:.2f} A, CN = {cn_cut:.2f}'
                     )
                     ax.legend(fontsize=8)
 
@@ -2122,7 +2115,7 @@ class Analyzer:
 
                 ['Mixing_sweeps', self.config.mixing_sweeps],
                 ['Final_sweeps', self.config.final_sweeps],
-                
+
                 ['Mode', 'Continue' if self.config.continue_mode else 'Full'],
 
                 ['freud', 'Yes' if FREUD_AVAILABLE else 'No']
@@ -2518,7 +2511,7 @@ class SensitivityAnalyzer:
                     'Energy': U_tot
                 })
 
-                logger.info(f"  Cutoff={cut:.1f} Å, alpha={alpha:.2f}: E={U_tot:.6f} eV/atom")
+                logger.info(f"  Cutoff={cut:.1f} A, alpha={alpha:.2f}: E={U_tot:.6f} eV/atom")
 
         return res
 
@@ -2526,14 +2519,14 @@ class SensitivityAnalyzer:
 # =========================
 # CLI
 # =========================
-app = typer.Typer(help="45S5/Sr Bioglass NVT Monte Carlo - Enhanced v8.1")
+app = typer.Typer(help="45S5/Sr Bioglass NVT Monte Carlo - Enhanced v8.2")
 
 
 @app.command()
 def run(
     input_file: Path = typer.Argument(
         ...,
-        help="Input XYZ file generated by structure_generator_paper.py"
+        help="Input XYZ file generated by struture.py"
     ),
     seed: Optional[int] = typer.Option(
         None,
@@ -2562,7 +2555,7 @@ def run(
     continue_mode: bool = typer.Option(
         False,
         "--continue",
-        help="Skip mixing/annealing. Use for relaxing an already-equilibrated structure (e.g., final_structure.xyz)."
+        help="Skip mixing/annealing. Use for relaxing an already-equilibrated structure."
     )
 ):
     try:
@@ -2627,7 +2620,6 @@ def run(
         final_types = system.type_indices.copy()
         box = system.box
 
-        # Block averaging over production energy samples.
         log_freq = getattr(sim, "log_freq", sim.decomposition_freq)
         prod_samples = max(1, sim.final_steps // log_freq)
 

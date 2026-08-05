@@ -1,0 +1,14 @@
+# x=0 (45S5 خالص)
+python struture.py --sr 0 --density 2.649 --seed 42
+
+# x=1 (S1)
+python struture.py --sr 1 --density 2.646 --seed 42
+
+# x=5 (S5)
+python struture.py --sr 5 --density 2.712 --seed 42
+
+# x=10 (S10)
+python struture.py --sr 10 --density 2.791 --seed 42
+
+# x=15 (S15)
+python struture.py --sr 15 --density 2.845 --seed 42
