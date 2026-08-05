@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-45S5/Sr Bioglass NVT Monte Carlo - Enhanced Version v8.0
+45S5/Sr Bioglass NVT Monte Carlo - Enhanced Version v8.1
 Based on: Xiang & Du, Chem. Mater. 2011, 23, 2703-2717
 
-Enhancements for reducing Free Oxygen (FO) and improving CN accuracy:
-- Cyclic annealing protocol to escape local minima
-- Enhanced oxygen displacement at high temperatures
-- Defect healing stage before production
-- Improved auto-cutoff detection for accurate CN
-- Extended low-T relaxation
+New in v8.1:
+- Added --continue mode to deeply relax already-equilibrated structures 
+  (skips melting/annealing, performs short healing + long production).
+- Cyclic annealing protocol to escape local minima.
+- Enhanced oxygen displacement at high temperatures to reduce FO.
+- Improved auto-cutoff detection for accurate CN.
 """
 
 import numpy as np
@@ -30,6 +30,7 @@ from typing import List, Optional, Dict, Tuple
 from pathlib import Path
 from scipy.spatial import cKDTree
 from scipy.integrate import trapezoid
+from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm
 from numba import njit
 from math import erfc, exp, sqrt, pi
@@ -94,11 +95,6 @@ class FileError(SimulationError):
 
 
 def parse_xyz_header(path: Path):
-    """
-    Parse first two lines of XYZ.
-    Expected comment from structure_generator_paper.py:
-    Xiang-Du 2011, x=0 mol% SrO, N=11340, rho=2.6490 g/cm3, box=53.6789 A, seed=42
-    """
     if not path.exists():
         raise FileError(f"File not found: {path}")
 
@@ -153,6 +149,9 @@ class SimulationConfig:
     x: int = 0
     box_override: Optional[float] = None
     output_dir: Optional[Path] = None
+    
+    # NEW: Continue mode flag
+    continue_mode: bool = False
 
     # MC schedule in sweeps (1 sweep = N atom move attempts)
     mixing_temp: float = 4000.0
@@ -160,30 +159,17 @@ class SimulationConfig:
 
     # Enhanced cyclic annealing protocol
     annealing_sweeps: List[Tuple[float, int]] = field(default_factory=lambda: [
-        (3000, 4),
-        (2500, 4),
-        (2000, 6),   # First cycle up
-        (1500, 6),
-        (1200, 8),
-        (2000, 5),   # Re-heating cycle 1
-        (1500, 6),
-        (1000, 8),
-        (2000, 5),   # Re-heating cycle 2
-        (1500, 6),
-        (1000, 8),
-        (800, 10),
-        (700, 10),
-        (600, 8),
-        (500, 6),
-        (400, 5),
-        (300, 5)
+        (3000, 4), (2500, 4), (2000, 6), (1500, 6), (1200, 8),
+        (2000, 5), (1500, 6), (1000, 8), (2000, 5), (1500, 6),
+        (1000, 8), (800, 10), (700, 10), (600, 8), (500, 6),
+        (400, 5), (300, 5)
     ])
 
     # Defect healing stage
     healing_temp: float = 2500.0
     healing_sweeps: int = 5
 
-    low_t_sweeps: int = 8  # Extended from 5 to 8
+    low_t_sweeps: int = 8  
     final_sweeps: int = 30
 
     snapshot_interval: Optional[int] = None
@@ -222,12 +208,8 @@ class Potential:
         self.zbl_c = np.array([0.1818, 0.5099, 0.2802, 0.02817])
         self.zbl_d = np.array([3.2, 0.9423, 0.4029, 0.2016])
         self.zbl_z = {
-            'Si': 14.0,
-            'Ca': 20.0,
-            'Na': 11.0,
-            'P': 15.0,
-            'O': 8.0,
-            'Sr': 38.0
+            'Si': 14.0, 'Ca': 20.0, 'Na': 11.0,
+            'P': 15.0, 'O': 8.0, 'Sr': 38.0
         }
 
         # Xiang & Du 2011, Table 2
@@ -252,30 +234,18 @@ class GlassSystem:
         self.config = config
 
         self.masses = {
-            'Si': 28.0855,
-            'Ca': 40.078,
-            'Na': 22.98977,
-            'P': 30.97376,
-            'O': 15.999,
-            'Sr': 87.62
+            'Si': 28.0855, 'Ca': 40.078, 'Na': 22.98977,
+            'P': 30.97376, 'O': 15.999, 'Sr': 87.62
         }
 
         self.type_map = {
-            'Si': 0,
-            'Ca': 1,
-            'Na': 2,
-            'P': 3,
-            'O': 4,
-            'Sr': 5
+            'Si': 0, 'Ca': 1, 'Na': 2,
+            'P': 3, 'O': 4, 'Sr': 5
         }
 
         self.type_to_elem = {
-            0: 'Si',
-            1: 'Ca',
-            2: 'Na',
-            3: 'P',
-            4: 'O',
-            5: 'Sr'
+            0: 'Si', 1: 'Ca', 2: 'Na',
+            3: 'P', 4: 'O', 5: 'Sr'
         }
 
         self.potential = Potential()
@@ -371,12 +341,8 @@ class GlassSystem:
 
     def _compute_charges(self):
         base = {
-            'Si': 2.4,
-            'Ca': 1.2,
-            'Na': 0.6,
-            'P': 3.0,
-            'O': -1.2,
-            'Sr': 1.2
+            'Si': 2.4, 'Ca': 1.2, 'Na': 0.6,
+            'P': 3.0, 'O': -1.2, 'Sr': 1.2
         }
 
         self.charges = np.array(
@@ -744,12 +710,8 @@ class MCSimulator:
 
         # Enhanced max_disp - larger for oxygen at high temperatures
         self.max_disp = {
-            'Si': 0.04,
-            'Ca': 0.08,
-            'Na': 0.08,
-            'P': 0.05,
-            'O': 0.08,  # Increased from 0.06 to 0.08
-            'Sr': 0.08
+            'Si': 0.04, 'Ca': 0.08, 'Na': 0.08,
+            'P': 0.05, 'O': 0.08, 'Sr': 0.08
         }
 
         self.energy_log = []
@@ -1092,48 +1054,90 @@ class MCSimulator:
     def run(self):
         logger.info("=" * 70)
         logger.info(f"STARTING NVT MONTE CARLO - x={self.config.x} mol% SrO")
+        if self.config.continue_mode:
+            logger.info("MODE: CONTINUE (Skipping full melting/annealing)")
         logger.info("=" * 70)
 
-        # High-temperature mixing with enhanced oxygen mobility
-        self._run_stage(
-            self.config.mixing_temp,
-            self.mixing_steps,
-            "Mixing",
-            adaptive=True,
-            mixing=True,
-            enhance_oxygen=True
-        )
+        if self.config.continue_mode:
+            # ================================
+            # CONTINUE MODE PROTOCOL
+            # ================================
+            # 1. Short healing to break residual bad bonds (like FO)
+            logger.info("Performing short healing on the input structure...")
+            self._run_stage(
+                2500.0, 
+                max(1, int(3 * self.system.N_ATOMS)), 
+                "Short Healing", 
+                adaptive=True, 
+                enhance_oxygen=True
+            )
+            
+            # 2. Cool down
+            self._run_stage(
+                1500.0, 
+                max(1, int(2 * self.system.N_ATOMS)), 
+                "Cool down 1", 
+                adaptive=True
+            )
+            self._run_stage(
+                800.0, 
+                max(1, int(2 * self.system.N_ATOMS)), 
+                "Cool down 2", 
+                adaptive=True
+            )
 
-        # Cyclic annealing with enhanced oxygen mobility at high temperatures
-        for i, (T, steps) in enumerate(self.annealing_stages):
-            self._run_stage(T, steps, f"Annealing {i + 1}", adaptive=True, enhance_oxygen=True)
+            # 3. Low-T relaxation
+            for k in self.max_disp:
+                self.max_disp[k] *= 0.5
+            self._run_stage(1.0, self.low_t_steps, "Low-T relaxation", adaptive=False)
 
-        # Reduce displacements before healing
-        for k in self.max_disp:
-            self.max_disp[k] *= 0.7
+        else:
+            # ================================
+            # FULL PROTOCOL (Original)
+            # ================================
+            # High-temperature mixing with enhanced oxygen mobility
+            self._run_stage(
+                self.config.mixing_temp,
+                self.mixing_steps,
+                "Mixing",
+                adaptive=True,
+                mixing=True,
+                enhance_oxygen=True
+            )
 
-        # Defect healing stage - helps eliminate remaining FO
-        logger.info(f"Defect Healing: T={self.config.healing_temp:.1f} K")
-        self._run_stage(
-            self.config.healing_temp,
-            self.healing_steps,
-            "Defect Healing",
-            adaptive=True,
-            enhance_oxygen=True
-        )
+            # Cyclic annealing with enhanced oxygen mobility at high temperatures
+            for i, (T, steps) in enumerate(self.annealing_stages):
+                self._run_stage(T, steps, f"Annealing {i + 1}", adaptive=True, enhance_oxygen=True)
 
-        # Cool down again after healing
-        self._run_stage(1000.0, max(1, int(3 * self.system.N_ATOMS)), 
-                       "Cool after healing", adaptive=True)
-        self._run_stage(600.0, max(1, int(2 * self.system.N_ATOMS)), 
-                       "Cool after healing", adaptive=True)
+            # Reduce displacements before healing
+            for k in self.max_disp:
+                self.max_disp[k] *= 0.7
 
-        # Extended low-T relaxation
-        for k in self.max_disp:
-            self.max_disp[k] *= 0.5
+            # Defect healing stage - helps eliminate remaining FO
+            logger.info(f"Defect Healing: T={self.config.healing_temp:.1f} K")
+            self._run_stage(
+                self.config.healing_temp,
+                self.healing_steps,
+                "Defect Healing",
+                adaptive=True,
+                enhance_oxygen=True
+            )
 
-        self._run_stage(1.0, self.low_t_steps, "Low-T relaxation", adaptive=False)
+            # Cool down again after healing
+            self._run_stage(1000.0, max(1, int(3 * self.system.N_ATOMS)), 
+                           "Cool after healing", adaptive=True)
+            self._run_stage(600.0, max(1, int(2 * self.system.N_ATOMS)), 
+                           "Cool after healing", adaptive=True)
 
+            # Extended low-T relaxation
+            for k in self.max_disp:
+                self.max_disp[k] *= 0.5
+
+            self._run_stage(1.0, self.low_t_steps, "Low-T relaxation", adaptive=False)
+
+        # ================================
+        # PRODUCTION (Common for both modes)
+        # ================================
         # Prepare for production
         for k in self.max_disp:
             self.max_disp[k] = min(max(self.max_disp[k] * 0.8, 0.02), 0.15)
@@ -1293,7 +1297,6 @@ class Analyzer:
             return None
 
         # Smooth the g(r) to avoid noise-induced false minima
-        from scipy.ndimage import gaussian_filter1d
         gr_smooth = gaussian_filter1d(gr_masked, sigma=2.0)
 
         diff = np.diff(gr_smooth)
@@ -2083,6 +2086,8 @@ class Analyzer:
 
                 ['Mixing_sweeps', self.config.mixing_sweeps],
                 ['Final_sweeps', self.config.final_sweeps],
+                
+                ['Mode', 'Continue' if self.config.continue_mode else 'Full'],
 
                 ['freud', 'Yes' if FREUD_AVAILABLE else 'No']
             ]
@@ -2485,7 +2490,7 @@ class SensitivityAnalyzer:
 # =========================
 # CLI
 # =========================
-app = typer.Typer(help="45S5/Sr Bioglass NVT Monte Carlo - Enhanced v8.0")
+app = typer.Typer(help="45S5/Sr Bioglass NVT Monte Carlo - Enhanced v8.1")
 
 
 @app.command()
@@ -2517,6 +2522,11 @@ def run(
     wolf_alpha: float = typer.Option(
         0.25,
         help="Wolf damping parameter alpha."
+    ),
+    continue_mode: bool = typer.Option(
+        False,
+        "--continue",
+        help="Skip mixing/annealing. Use for relaxing an already-equilibrated structure (e.g., final_structure.xyz)."
     )
 ):
     try:
@@ -2546,7 +2556,8 @@ def run(
             output_dir=output_dir,
             n_cores=cores,
             cutoff=cutoff,
-            wolf_alpha=wolf_alpha
+            wolf_alpha=wolf_alpha,
+            continue_mode=continue_mode
         )
 
         if final_sweeps is not None:
@@ -2562,6 +2573,7 @@ def run(
         logger.info(f"Seed       : {seed}")
         logger.info(f"Density    : {density if density is not None else 'parsed from box'}")
         logger.info(f"Box        : {box_override if box_override is not None else 'computed from density'}")
+        logger.info(f"Mode       : {'CONTINUE' if continue_mode else 'FULL PROTOCOL'}")
         logger.info(f"Output dir : {config.output_dir}")
 
         system = GlassSystem(config)
