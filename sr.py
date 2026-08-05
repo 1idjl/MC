@@ -212,19 +212,30 @@ class Potential:
             'P': 15.0, 'O': 8.0, 'Sr': 38.0
         }
 
-        # Xiang & Du 2011, Table 2
+        # Xiang & Du 2011, Table 2 + NEW repulsive terms
         self.buck_params = {
             ('Si', 'O'): {'A': 13702.905,  'F': 0.193817, 'C': 54.681},
             ('P',  'O'): {'A': 26655.472,  'F': 0.181968, 'C': 86.856},
             ('O',  'O'): {'A': 2029.2204,  'F': 0.343645, 'C': 192.58},
             ('Na', 'O'): {'A': 4383.7555,  'F': 0.243838, 'C': 30.70},
             ('Ca', 'O'): {'A': 7747.1834,  'F': 0.252623, 'C': 93.109},
-            ('Sr', 'O'): {'A': 14566.637,  'F': 0.245015, 'C': 81.773}
+            ('Sr', 'O'): {'A': 14566.637,  'F': 0.245015, 'C': 81.773},
+            # ===== NEW: Repulsive terms to prevent Si-Si, Si-P, P-P bonds =====
+            ('Si', 'Si'): {'A': 3000.0, 'F': 0.30, 'C': 0.0},
+            ('Si', 'P'):  {'A': 3000.0, 'F': 0.30, 'C': 0.0},
+            ('P',  'P'):  {'A': 3000.0, 'F': 0.30, 'C': 0.0},
         }
 
         self.r_hard_default = 0.9
-        self.r_hard_by_pair = {('O', 'O'): 1.4}
+        # ===== UPDATED: Larger r_hard for network former pairs =====
+        self.r_hard_by_pair = {
+            ('O', 'O'): 1.4,
+            ('Si', 'Si'): 2.0,   # Prevent Si-Si bonds
+            ('Si', 'P'): 2.0,    # Prevent Si-P close contact
+            ('P',  'P'): 2.0,    # Prevent P-P close contact
+        }
 
+        self.sbs_x_o = {'Ca': 32.0, 'Na': 20.0, 'Sr': 32.0}
 
 # =========================
 # GLASS SYSTEM
@@ -887,45 +898,30 @@ class MCSimulator:
         neigh, st = self.nl.neighbors, self.nl.starts
 
         old_e = local_energy(
-            i,
-            self.system.coords,
-            self.system.charges,
-            self.system.type_indices,
-            self.type_Z,
-            self.A_mat,
-            self.F_mat,
-            self.C_mat,
-            self.R_HARD_MAT,
-            self.system.box,
-            self.config.cutoff,
-            self.config.wolf_alpha,
-            neigh,
-            st,
-            self.system.potential.zbl_a0,
-            self.system.potential.zbl_c,
+            i, self.system.coords, self.system.charges, self.system.type_indices,
+            self.type_Z, self.A_mat, self.F_mat, self.C_mat, self.R_HARD_MAT,
+            self.system.box, self.config.cutoff, self.config.wolf_alpha,
+            neigh, st,
+            self.system.potential.zbl_a0, self.system.potential.zbl_c,
             self.system.potential.zbl_d
         )
 
         delta = self.rng.uniform(-maxd, maxd, size=3)
         self.system.coords[i] = (old_pos + delta) % self.system.box
 
+        # ===== NEW: Hard geometric constraint for network formers =====
+        # This prevents Si-Si, Si-P, P-P bonds BEFORE energy calculation
+        if not self._check_nf_geometry(i):
+            self.system.coords[i] = old_pos
+            return False
+        # ================================================================
+
         new_e = local_energy(
-            i,
-            self.system.coords,
-            self.system.charges,
-            self.system.type_indices,
-            self.type_Z,
-            self.A_mat,
-            self.F_mat,
-            self.C_mat,
-            self.R_HARD_MAT,
-            self.system.box,
-            self.config.cutoff,
-            self.config.wolf_alpha,
-            neigh,
-            st,
-            self.system.potential.zbl_a0,
-            self.system.potential.zbl_c,
+            i, self.system.coords, self.system.charges, self.system.type_indices,
+            self.type_Z, self.A_mat, self.F_mat, self.C_mat, self.R_HARD_MAT,
+            self.system.box, self.config.cutoff, self.config.wolf_alpha,
+            neigh, st,
+            self.system.potential.zbl_a0, self.system.potential.zbl_c,
             self.system.potential.zbl_d
         )
 
@@ -1050,7 +1046,47 @@ class MCSimulator:
         self.max_disp = orig_disp
 
         logger.info(f"  Stage acceptance: {stage_acc / max(1, stage_att) * 100:.2f}%")
-
+    def _check_nf_geometry(self, idx):
+        """
+        Hard constraint: Prevent unphysical Si-Si, Si-P, P-P close contacts.
+        This check is performed BEFORE energy calculation for efficiency.
+        Returns True if geometry is valid, False otherwise.
+        """
+        ti = self.system.type_indices[idx]
+        
+        # Only check for network formers (Si=0, P=3)
+        if ti not in (0, 3):
+            return True
+        
+        xi, yi, zi = self.system.coords[idx]
+        box = self.system.box
+        neigh, st = self.nl.neighbors, self.nl.starts
+        
+        # Minimum allowed distance between network formers (Å)
+        MIN_NF_DIST_SQ = 2.5 ** 2  # 6.25 Å²
+        
+        for p in range(st[idx], st[idx + 1]):
+            j = neigh[p]
+            tj = self.system.type_indices[j]
+            
+            # Only check against other network formers
+            if tj not in (0, 3):
+                continue
+            
+            dx = xi - self.system.coords[j, 0]
+            dy = yi - self.system.coords[j, 1]
+            dz = zi - self.system.coords[j, 2]
+            
+            dx -= box * round(dx / box)
+            dy -= box * round(dy / box)
+            dz -= box * round(dz / box)
+            
+            r2 = dx * dx + dy * dy + dz * dz
+            
+            if r2 < MIN_NF_DIST_SQ:
+                return False
+        
+        return True
     def run(self):
         logger.info("=" * 70)
         logger.info(f"STARTING NVT MONTE CARLO - x={self.config.x} mol% SrO")
