@@ -1061,3 +1061,4 @@ if __name__ == "__main__":
                         help="Path to energy_log.csv from Sr.py (optional)")
     args = parser.parse_args()
     run_analysis(args.input, output_dir=args.output_dir, energy_log_path=args.energy_log)
+    

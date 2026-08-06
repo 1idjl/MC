@@ -555,3 +555,4 @@ if __name__ == "__main__":
         args.out = f"initial_Sr{args.sr}.xyz"
 
     generate_structure(args.sr, args.density, args.out, args.seed, args.scale)
+    
