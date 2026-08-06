@@ -12,3 +12,8 @@ python struture.py --sr 10 --density 2.791 --seed 42
 
 # x=15 (S15)
 python struture.py --sr 15 --density 2.845 --seed 42
+# 1. ساخت ساختار اولیه جدید
+python struture.py --sr 0 --density 2.649 --seed 42
+
+# 2. اجرای شبیه‌سازی
+python Sr.py initial_Sr0.xyz --final-sweeps 150 --cores 12
