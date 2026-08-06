@@ -1,55 +1,34 @@
-# ترکیب 45-M0 (x=0 mol% MgO)
-python structure_generator_paper.py --mg 0 --density 2.6738 --out initial_Mg0_large.xyz --seed 42 --scale 4
+# 45-M0
+python structure_generator_paper_mg.py --mg 0 --scale 4 --seed 42
+python simulation_mg.py initial_Mg0.xyz --final-sweeps 50000 --cores 12
 
-# ترکیب 45-M1 (x=1 mol% MgO)
-python structure_generator_paper.py --mg 1 --density 2.6543 --out initial_Mg1_large.xyz --seed 42 --scale 4
+# 45-M1
+python structure_generator_paper_mg.py --mg 1 --scale 4 --seed 42
+python simulation_mg.py initial_Mg1.xyz --final-sweeps 50000 --cores 12
 
-# ترکیب 45-M3 (x=3 mol% MgO)
-python structure_generator_paper.py --mg 3 --density 2.6388 --out initial_Mg3_large.xyz --seed 42 --scale 4
+# 45-M3
+python structure_generator_paper_mg.py --mg 3 --scale 4 --seed 42
+python simulation_mg.py initial_Mg3.xyz --final-sweeps 50000 --cores 12
 
-# ترکیب 45-M5 (x=5 mol% MgO)
-python structure_generator_paper.py --mg 5 --density 2.6298 --out initial_Mg5_large.xyz --seed 42 --scale 4
+# 45-M5
+python structure_generator_paper_mg.py --mg 5 --scale 4 --seed 42
+python simulation_mg.py initial_Mg5.xyz --final-sweeps 50000 --cores 12
 
-# ترکیب 45-M8 (x=8 mol% MgO)
-python structure_generator_paper.py --mg 8 --density 2.6189 --out initial_Mg8_large.xyz --seed 42 --scale 4
+# 45-M8
+python structure_generator_paper_mg.py --mg 8 --scale 4 --seed 42
+python simulation_mg.py initial_Mg8.xyz --final-sweeps 50000 --cores 12
 
-# ترکیب 45-M10 (x=10 mol% MgO)
-python structure_generator_paper.py --mg 10 --density 2.6144 --out initial_Mg10_large.xyz --seed 42 --scale 4
+# 45-M10
+python structure_generator_paper_mg.py --mg 10 --scale 4 --seed 42
+python simulation_mg.py initial_Mg10.xyz --final-sweeps 50000 --cores 12
 
-# ترکیب 45-M15 (x=15 mol% MgO)
-python structure_generator_paper.py --mg 15 --density 2.5846 --out initial_Mg15_large.xyz --seed 42 --scale 4
+# 45-M15
+python structure_generator_paper_mg.py --mg 15 --scale 4 --seed 42
+python simulation_mg.py initial_Mg15.xyz --final-sweeps 50000 --cores 12
 
-# ترکیب 45-M20 (x=20 mol% MgO)
-python structure_generator_paper.py --mg 20 --density 2.5502 --out initial_Mg20_large.xyz --seed 42 --scale 4
+# 45-M20
+python structure_generator_paper_mg.py --mg 20 --scale 4 --seed 42
+python simulation_mg.py initial_Mg20.xyz --final-sweeps 50000 --cores 12
 
-# ترکیب 45-M0 (x=0 mol% MgO)
-python simulation.py initial_Mg0_large.xyz --x 0 --final-sweeps 150 --cores 12
 
-# ترکیب 45-M1 (x=1 mol% MgO)
-python simulation.py initial_Mg1_large.xyz --x 1 --final-sweeps 150 --cores 12
-
-# ترکیب 45-M3 (x=3 mol% MgO)
-python simulation.py initial_Mg3_large.xyz --x 3 --final-sweeps 150 --cores 12
-
-# ترکیب 45-M5 (x=5 mol% MgO)
-python simulation.py initial_Mg5_large.xyz --x 5 --final-sweeps 150 --cores 12
-
-# ترکیب 45-M8 (x=8 mol% MgO)
-python simulation.py initial_Mg8_large.xyz --x 8 --final-sweeps 150 --cores 12
-
-# ترکیب 45-M10 (x=10 mol% MgO)
-python simulation.py initial_Mg10_large.xyz --x 10 --final-sweeps 150 --cores 12
-
-# ترکیب 45-M15 (x=15 mol% MgO)
-python simulation.py initial_Mg15_large.xyz --x 15 --final-sweeps 150 --cores 12
-
-# ترکیب 45-M20 (x=20 mol% MgO)
-python simulation.py initial_Mg20_large.xyz --x 20 --final-sweeps 150 --cores 12
-
-# تحلیل نتیجه ترکیب 45-M0 (اگر پوشه خروجی شبیه‌سازی `Bioglass_x0_N11340_seed42` باشد)
-python analyze_final.py --input Bioglass_x0_N11340_seed42/final_structure.xyz --output-dir analysis_Mg0 --energy-log Bioglass_x0_N11340_seed42/energy_log.csv
-
-# تحلیل نتیجه ترکیب 45-M5 (اگر پوشه خروجی شبیه‌سازی `Bioglass_x5_N11340_seed42` باشد)
-python analyze_final.py --input Bioglass_x5_N11340_seed42/final_structure.xyz --output-dir analysis_Mg5 --energy-log Bioglass_x5_N11340_seed42/energy_log.csv
-
-# ... و به همین ترتیب برای بقیه ترکیبات
+python analyze_mg_final.py Bioglass_Mg5_N11340_seed42/final_structure.xyz --energy-log Bioglass_Mg5_N11340_seed42/energy_log.csv
