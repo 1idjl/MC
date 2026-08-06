@@ -500,4 +500,5 @@ if __name__ == "__main__":
     if args.out is None:
         args.out = f"initial_Sr{args.sr}.xyz"
 
+
     generate_structure(args.sr, args.density, args.out, args.seed)
