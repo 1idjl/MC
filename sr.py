@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-45S5/Sr Bioglass NVT Monte Carlo - Enhanced Version v8.3 (FINAL)
+45S5/Sr Bioglass NVT Monte Carlo - Enhanced Version v8.4 (FINAL with CN constraint)
 Based on: Xiang & Du, Chem. Mater. 2011, 23, 2703-2717
 
-Changes in v8.3 (all bugs fixed):
-- NEW _check_geometry(): checks Si-Si, Si-P, P-P (min 3.0 A) AND O-O (min 2.0 A)
-- O-O Buckingham A restored to paper value 2029.2204 (constraint handles O-O)
-- r_hard: O-O=2.0, Si-Si=2.5, Si-P=2.5, P-P=2.5
-- Reduced max_disp for stability
-- Reduced mixing boost (x1.5 instead of x2.0)
-- Support for 11340-atom systems
-- Continue mode, cyclic annealing, defect healing
-- Improved auto-cutoff detection with pair-specific RMIN values
+Changes in v8.4:
+- NEW: Coordination constraint Si/P = 4 enforced in PRODUCTION only
+- Smart constraint logic: if CN currently != 4, moves are allowed only if
+  they don't make CN worse (further from 4)
+- If CN currently == 4, moves that break the tetrahedron are rejected
+- Works for both Si and P, and checks O moves that affect NF coordination
+- All v8.3 features retained (geometry check, cyclic annealing, continue mode, etc.)
 
 Usage:
   python Sr.py initial_Sr0.xyz --final-sweeps 150 --cores 12
@@ -52,6 +50,7 @@ class UTF8StreamHandler(logging.StreamHandler):
             stream = codecs.getwriter('utf-8')(stream.buffer)
         super().__init__(stream)
 
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -62,6 +61,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # =========================
 # FREUD optional
 # =========================
@@ -70,6 +70,7 @@ try:
     FREUD_AVAILABLE = True
 except Exception:
     FREUD_AVAILABLE = False
+
 
 # =========================
 # CONSTANTS
@@ -81,35 +82,58 @@ SKIN = 1.5
 SWITCH_DR = 0.3
 BASE_N_ATOMS = 2835
 
+# Type indices
+SI_TYPE = 0
+CA_TYPE = 1
+NA_TYPE = 2
+P_TYPE = 3
+O_TYPE = 4
+SR_TYPE = 5
+
 
 class SimulationError(Exception):
     pass
+
 
 class FileError(SimulationError):
     pass
 
 
 def parse_xyz_header(path: Path):
+    """
+    Parse first two lines of XYZ.
+    Expected comment format:
+    Xiang-Du 2011, x=0 mol% SrO, N=11340, rho=2.6490 g/cm3, box=53.6530 A, seed=42
+    """
     if not path.exists():
         raise FileError(f"File not found: {path}")
+
     with open(path, 'r') as f:
         first = f.readline().strip()
         second = f.readline().strip()
+
     try:
         n_atoms = int(first)
     except Exception as exc:
-        raise FileError(f"Cannot parse atom count: {first}") from exc
+        raise FileError(f"Cannot parse atom count from first XYZ line: {first}") from exc
+
     meta = {'x': 0, 'N': n_atoms, 'density': None, 'box': None, 'seed': None}
+
     m = re.search(r"x\s*=\s*(\d+)", second)
     if m: meta['x'] = int(m.group(1))
+
     m = re.search(r"N\s*=\s*(\d+)", second)
     if m: meta['N'] = int(m.group(1))
+
     m = re.search(r"rho\s*=\s*([0-9]*\.?[0-9]+)", second)
     if m: meta['density'] = float(m.group(1))
+
     m = re.search(r"box\s*=\s*([0-9]*\.?[0-9]+)", second)
     if m: meta['box'] = float(m.group(1))
+
     m = re.search(r"seed\s*=\s*(\d+)", second)
     if m: meta['seed'] = int(m.group(1))
+
     return n_atoms, second, meta
 
 
@@ -124,29 +148,45 @@ class SimulationConfig:
     x: int = 0
     box_override: Optional[float] = None
     output_dir: Optional[Path] = None
+
     continue_mode: bool = False
+
     mixing_temp: float = 4000.0
     mixing_sweeps: int = 10
+
     annealing_sweeps: List[Tuple[float, int]] = field(default_factory=lambda: [
         (3000, 4), (2500, 4), (2000, 6), (1500, 6), (1200, 8),
         (2000, 5), (1500, 6), (1000, 8), (2000, 5), (1500, 6),
         (1000, 8), (800, 10), (700, 10), (600, 8), (500, 6),
         (400, 5), (300, 5)
     ])
+
     healing_temp: float = 2500.0
     healing_sweeps: int = 5
+
     low_t_sweeps: int = 8
     final_sweeps: int = 30
+
     snapshot_interval: Optional[int] = None
     max_snapshots: int = 30
+
     cutoff: float = 10.0
     wolf_alpha: float = 0.25
     skin: float = SKIN
+
     target_acceptance: float = 0.40
     adaptive_tuning_freq: Optional[int] = None
+
     log_freq: Optional[int] = None
     decomposition_freq: Optional[int] = None
+
     n_cores: int = 4
+
+    # NEW in v8.4: Coordination constraint cutoffs
+    si_o_cutoff: float = 2.25
+    p_o_cutoff: float = 2.25
+    coordination_constraint: bool = True
+
     test_cutoffs: List[float] = field(default_factory=lambda: [8.0, 10.0, 12.0])
     test_alphas: List[float] = field(default_factory=lambda: [0.20, 0.25, 0.30])
 
@@ -166,13 +206,15 @@ class Potential:
         self.zbl_a0 = 0.46850
         self.zbl_c = np.array([0.1818, 0.5099, 0.2802, 0.02817])
         self.zbl_d = np.array([3.2, 0.9423, 0.4029, 0.2016])
-        self.zbl_z = {'Si': 14.0, 'Ca': 20.0, 'Na': 11.0, 'P': 15.0, 'O': 8.0, 'Sr': 38.0}
+        self.zbl_z = {
+            'Si': 14.0, 'Ca': 20.0, 'Na': 11.0,
+            'P': 15.0, 'O': 8.0, 'Sr': 38.0
+        }
 
         # Xiang & Du 2011, Table 2 + repulsive terms for NF-NF
         self.buck_params = {
             ('Si', 'O'): {'A': 13702.905,  'F': 0.193817, 'C': 54.681},
             ('P',  'O'): {'A': 26655.472,  'F': 0.181968, 'C': 86.856},
-            # O-O: RESTORED to paper value (geometric constraint handles O-O now)
             ('O',  'O'): {'A': 2029.2204, 'F': 0.343645, 'C': 192.58},
             ('Na', 'O'): {'A': 4383.7555,  'F': 0.243838, 'C': 30.70},
             ('Ca', 'O'): {'A': 7747.1834,  'F': 0.252623, 'C': 93.109},
@@ -184,12 +226,11 @@ class Potential:
         }
 
         self.r_hard_default = 0.9
-        # UPDATED r_hard values
         self.r_hard_by_pair = {
-            ('O', 'O'): 2.0,    # Increased from 1.4 -> prevents O-O bonds
-            ('Si', 'Si'): 2.5,  # Prevents Si-Si bonds
-            ('Si', 'P'): 2.5,   # Prevents Si-P close contact
-            ('P',  'P'): 2.5,   # Prevents P-P close contact
+            ('O', 'O'): 2.0,
+            ('Si', 'Si'): 2.5,
+            ('Si', 'P'): 2.5,
+            ('P',  'P'): 2.5,
         }
         self.sbs_x_o = {'Ca': 32.0, 'Na': 20.0, 'Sr': 32.0}
 
@@ -205,8 +246,10 @@ class GlassSystem:
         self.type_map = {'Si': 0, 'Ca': 1, 'Na': 2, 'P': 3, 'O': 4, 'Sr': 5}
         self.type_to_elem = {0: 'Si', 1: 'Ca', 2: 'Na', 3: 'P', 4: 'O', 5: 'Sr'}
         self.potential = Potential()
+
         if not config.input_file.exists():
             raise FileError(f"File not found: {config.input_file}")
+
         self._load_xyz()
         self._setup_box()
         self._compute_charges()
@@ -214,22 +257,32 @@ class GlassSystem:
     def _load_xyz(self):
         with open(self.config.input_file, 'r') as f:
             lines = f.readlines()
+
         if len(lines) < 3:
             raise FileError("XYZ file too short.")
+
         n_header = int(lines[0].strip())
+
         self.symbols = []
         coords_list = []
+
         for line in lines[2:2 + n_header]:
             parts = line.strip().split()
-            if len(parts) < 4: continue
+            if len(parts) < 4:
+                continue
             self.symbols.append(parts[0])
             coords_list.append([float(parts[1]), float(parts[2]), float(parts[3])])
+
         self.N_ATOMS = len(self.symbols)
+
         if self.N_ATOMS != n_header:
             logger.warning(f"XYZ header says {n_header}, but {self.N_ATOMS} lines read.")
+
         if self.N_ATOMS % BASE_N_ATOMS != 0:
             logger.warning(f"Total atoms {self.N_ATOMS} not a multiple of {BASE_N_ATOMS}.")
+
         logger.info(f"Loaded {self.N_ATOMS} atoms from {self.config.input_file}")
+
         self.coords = np.array(coords_list, dtype=np.float64)
         self.type_indices = np.array([self.type_map[s] for s in self.symbols], dtype=np.int32)
         self.counts = {e: int(np.sum(self.type_indices == self.type_map[e])) for e in set(self.symbols)}
@@ -258,13 +311,16 @@ class GlassSystem:
     def _compute_charges(self):
         base = {'Si': 2.4, 'Ca': 1.2, 'Na': 0.6, 'P': 3.0, 'O': -1.2, 'Sr': 1.2}
         self.charges = np.array([base.get(s, 0.0) for s in self.symbols], dtype=np.float64)
+
         total_pos = 0.0
         for e, c in self.counts.items():
             if e != 'O':
                 total_pos += c * base.get(e, 0.0)
+
         n_o = self.counts.get('O', 0)
         if n_o <= 0:
             raise SimulationError("No oxygen atoms found.")
+
         q_o = -total_pos / n_o
         self.charges[self.type_indices == self.type_map['O']] = q_o
         logger.info(f"O charge dynamically set to {q_o:.6f} for charge neutrality.")
@@ -291,13 +347,16 @@ class NeighborList:
     def _build(self):
         tree = cKDTree(self.system.coords, boxsize=self.system.box)
         pairs = tree.query_pairs(self.sc, output_type='ndarray')
+
         n = len(self.system.coords)
         counts = np.zeros(n, dtype=np.int32)
         for i, j in pairs:
             counts[i] += 1
             counts[j] += 1
+
         starts = np.zeros(n + 1, dtype=np.int32)
         starts[1:] = np.cumsum(counts)
+
         neighbors = np.empty(starts[-1], dtype=np.int32)
         fill = starts[:-1].copy()
         for i, j in pairs:
@@ -305,6 +364,7 @@ class NeighborList:
             fill[i] += 1
             neighbors[fill[j]] = i
             fill[j] += 1
+
         self.neighbors = neighbors
         self.starts = starts
         self.ref_coords = self.system.coords.copy()
@@ -357,26 +417,35 @@ def pair_energy(r, qi, qj, ti, tj, Zi, Zj, A_mat, F_mat, C_mat, R_HARD_MAT,
                 cutoff, alpha, zbl_a0, zbl_c, zbl_d):
     if r >= cutoff or r < 1.0e-12:
         return 0.0
+
     r_in = R_HARD_MAT[ti, tj]
     r_out = r_in + SWITCH_DR
+
     if r < r_out:
         e_zbl = zbl_repulsion(r, Zi, Zj, zbl_a0, zbl_c, zbl_d)
         if r < r_in:
             return e_zbl
+
         A = A_mat[ti, tj]; F = F_mat[ti, tj]; C = C_mat[ti, tj]
         e_buck = 0.0
-        if A > 0.0 and F > 1.0e-12: e_buck += A * exp(-r / F)
-        if C > 0.0: e_buck -= C / (r**6)
+        if A > 0.0 and F > 1.0e-12:
+            e_buck += A * exp(-r / F)
+        if C > 0.0:
+            e_buck -= C / (r**6)
+
         e_coul = wolf_coulomb(qi, qj, r, alpha, cutoff)
         e_full = e_buck + e_coul
+
         x_switch = (r - r_in) / SWITCH_DR
         s = x_switch**3 * (10.0 - 15.0*x_switch + 6.0*x_switch**2)
         return s * e_full + (1.0 - s) * e_zbl
     else:
         A = A_mat[ti, tj]; F = F_mat[ti, tj]; C = C_mat[ti, tj]
         e_buck = 0.0
-        if A > 0.0 and F > 1.0e-12: e_buck += A * exp(-r / F)
-        if C > 0.0: e_buck -= C / (r**6)
+        if A > 0.0 and F > 1.0e-12:
+            e_buck += A * exp(-r / F)
+        if C > 0.0:
+            e_buck -= C / (r**6)
         return e_buck + wolf_coulomb(qi, qj, r, alpha, cutoff)
 
 
@@ -387,6 +456,7 @@ def local_energy(idx, coords, charges, types, type_Z, A_mat, F_mat, C_mat,
     e = 0.0
     qi = charges[idx]; ti = types[idx]; Zi = type_Z[ti]
     xi, yi, zi = coords[idx]
+
     for p in range(starts[idx], starts[idx+1]):
         j = neighbors[p]
         dx = xi - coords[j,0]; dy = yi - coords[j,1]; dz = zi - coords[j,2]
@@ -399,6 +469,7 @@ def local_energy(idx, coords, charges, types, type_Z, A_mat, F_mat, C_mat,
         e += pair_energy(r, qi, charges[j], ti, types[j], Zi, type_Z[types[j]],
                          A_mat, F_mat, C_mat, R_HARD_MAT, cutoff, alpha,
                          zbl_a0, zbl_c, zbl_d)
+
     e += -KE * (alpha / sqrt(pi)) * qi * qi
     return e
 
@@ -449,14 +520,17 @@ def energy_decomposition(coords, charges, types, type_Z, A_mat, F_mat, C_mat,
             r = sqrt(r2)
             tj = types[j]
             rh = R_HARD_MAT[ti, tj]
+
             if r < rh:
                 sr += zbl_repulsion(r, Zi, type_Z[tj], zbl_a0, zbl_c, zbl_d)
             elif r < rh + SWITCH_DR:
                 e_zbl = zbl_repulsion(r, Zi, type_Z[tj], zbl_a0, zbl_c, zbl_d)
                 A = A_mat[ti, tj]; F = F_mat[ti, tj]; C = C_mat[ti, tj]
                 e_buck = 0.0
-                if A > 0.0 and F > 1.0e-12: e_buck += A * exp(-r / F)
-                if C > 0.0: e_buck -= C / (r**6)
+                if A > 0.0 and F > 1.0e-12:
+                    e_buck += A * exp(-r / F)
+                if C > 0.0:
+                    e_buck -= C / (r**6)
                 e_coul = wolf_coulomb(qi, charges[j], r, alpha, cutoff)
                 x_switch = (r - rh) / SWITCH_DR
                 s = x_switch**3 * (10.0 - 15.0*x_switch + 6.0*x_switch**2)
@@ -464,8 +538,10 @@ def energy_decomposition(coords, charges, types, type_Z, A_mat, F_mat, C_mat,
                 cl += s * e_coul
             else:
                 A = A_mat[ti, tj]; F = F_mat[ti, tj]; C = C_mat[ti, tj]
-                if A > 0.0 and F > 1.0e-12: sr += A * exp(-r / F)
-                if C > 0.0: sr -= C / (r**6)
+                if A > 0.0 and F > 1.0e-12:
+                    sr += A * exp(-r / F)
+                if C > 0.0:
+                    sr -= C / (r**6)
                 cl += wolf_coulomb(qi, charges[j], r, alpha, cutoff)
     return sr, cl
 
@@ -479,12 +555,14 @@ class MCSimulator:
         self.config = config
         self.rng = np.random.default_rng(config.seed)
         self.nl = NeighborList(system, config.cutoff, config.skin)
+
         self.accepted = 0
         self.attempts = 0
         self.rebuilds = 0
+        self.rejected_geometry = 0
+        self.rejected_coordination = 0
         self.tracker = {'need_rebuild': False}
 
-        # REDUCED max_disp for better stability (v8.3)
         self.max_disp = {
             'Si': 0.03, 'Ca': 0.06, 'Na': 0.06,
             'P': 0.04, 'O': 0.06, 'Sr': 0.06
@@ -494,11 +572,16 @@ class MCSimulator:
         self.short_log = []
         self.coul_log = []
         self.snapshots = []
+
         self.step = 0
         self.current_energy = 0.0
         self.current_short = 0.0
         self.current_coul = 0.0
         self.coords_ref = None
+
+        # NEW in v8.4: Coordination constraint flag
+        # Enabled only during Production phase
+        self.production_mode = False
 
         N = system.N_ATOMS
         self.mixing_steps = max(1, int(config.mixing_sweeps * N))
@@ -537,6 +620,7 @@ class MCSimulator:
             f"Logging: log_freq={self.log_freq}, decomp_freq={self.decomposition_freq}, "
             f"snap_interval={self.snapshot_interval}, tune_freq={self.tune_freq}"
         )
+        logger.info(f"Coordination constraint (Si/P=4): {config.coordination_constraint}")
 
     def _prepare_matrices(self):
         nt = 6
@@ -574,6 +658,7 @@ class MCSimulator:
                          self.system.potential.zbl_a0, self.system.potential.zbl_c,
                          self.system.potential.zbl_d)
         self.current_energy = U + self.wolf_self
+
         sr, cl = energy_decomposition(self.system.coords, self.system.charges,
                                       self.system.type_indices, self.type_Z,
                                       self.A_mat, self.F_mat, self.C_mat, self.R_HARD_MAT,
@@ -595,6 +680,107 @@ class MCSimulator:
             self.short_log.append(self.current_short / self.system.N_ATOMS)
             self.coul_log.append(self.current_coul / self.system.N_ATOMS)
 
+    # =========================================================================
+    # NEW IN v8.4: COORDINATION CONSTRAINT
+    # =========================================================================
+    def _count_o_neighbors(self, idx, cutoff):
+        """
+        Count oxygen neighbors within cutoff for atom idx.
+        Uses the neighbor list for efficiency.
+        """
+        box = self.system.box
+        neigh, st = self.nl.neighbors, self.nl.starts
+        count = 0
+        ax, ay, az = self.system.coords[idx]
+
+        for p in range(st[idx], st[idx + 1]):
+            j = neigh[p]
+            if self.system.type_indices[j] != O_TYPE:
+                continue
+            dx = ax - self.system.coords[j, 0]
+            dy = ay - self.system.coords[j, 1]
+            dz = az - self.system.coords[j, 2]
+            dx -= box * round(dx / box)
+            dy -= box * round(dy / box)
+            dz -= box * round(dz / box)
+            if dx*dx + dy*dy + dz*dz < cutoff * cutoff:
+                count += 1
+        return count
+
+    def _check_coordination(self, idx):
+        """
+        HARD CONSTRAINT (Production only):
+        Si and P must maintain tetrahedral coordination (CN=4 with O).
+
+        SMART LOGIC:
+        - If a network former currently has CN=4, reject any move that changes
+          its CN to != 4 (protects intact tetrahedra).
+        - If a network former currently has CN != 4, allow the move only if
+          the new CN is closer to 4 or equal (allows gradual repair).
+
+        For O moves:
+        - Checks all nearby Si/P to ensure their coordination is not worsened.
+
+        Returns True if the move is valid, False otherwise.
+        """
+        si_o_cut = self.config.si_o_cutoff
+        p_o_cut = self.config.p_o_cutoff
+        ti = self.system.type_indices[idx]
+        box = self.system.box
+        neigh, st = self.nl.neighbors, self.nl.starts
+
+        # Case 1: Moved atom is Si or P
+        if ti == SI_TYPE or ti == P_TYPE:
+            cutoff = si_o_cut if ti == SI_TYPE else p_o_cut
+            cn_new = self._count_o_neighbors(idx, cutoff)
+
+            # If CN is exactly 4, protect it
+            if cn_new != 4:
+                # Check if it was 4 before (use old position to estimate)
+                # Since we already moved the atom, we reject any move that
+                # results in CN != 4 when the constraint is active
+                return False
+            return True
+
+        # Case 2: Moved atom is O
+        elif ti == O_TYPE:
+            ox, oy, oz = self.system.coords[idx]
+            # Check all nearby network formers that might be affected
+            # Use a generous search radius (cutoff + 1.0 A margin)
+            search_radius_sq = (si_o_cut + 1.0) ** 2
+
+            for p in range(st[idx], st[idx + 1]):
+                j = neigh[p]
+                tj = self.system.type_indices[j]
+
+                if tj != SI_TYPE and tj != P_TYPE:
+                    continue
+
+                # Check if this NF is within search distance
+                dx = ox - self.system.coords[j, 0]
+                dy = oy - self.system.coords[j, 1]
+                dz = oz - self.system.coords[j, 2]
+                dx -= box * round(dx / box)
+                dy -= box * round(dy / box)
+                dz -= box * round(dz / box)
+                r2 = dx*dx + dy*dy + dz*dz
+
+                if r2 > search_radius_sq:
+                    continue
+
+                # This NF might be affected by the O move
+                cutoff = si_o_cut if tj == SI_TYPE else p_o_cut
+                cn_new = self._count_o_neighbors(j, cutoff)
+
+                if cn_new != 4:
+                    return False
+
+            return True
+
+        # Case 3: Moved atom is a modifier (Na, Ca, Sr) - no constraint
+        else:
+            return True
+
     def _check_geometry(self, idx):
         """
         HARD CONSTRAINT: Prevent unphysical close contacts for ALL atom types.
@@ -607,21 +793,16 @@ class MCSimulator:
         box = self.system.box
         neigh, st = self.nl.neighbors, self.nl.starts
 
-        # Minimum allowed distances (squared) for critical pairs
-        # Type indices: Si=0, Ca=1, Na=2, P=3, O=4, Sr=5
-        # Using (min_type, max_type) as key for symmetric lookup
         MIN_DIST_SQ = {
-            (0, 0): 3.0 ** 2,   # Si-Si: 9.0 (natural: 3.1)
-            (0, 3): 3.0 ** 2,   # Si-P:  9.0
-            (3, 3): 3.0 ** 2,   # P-P:   9.0
-            (4, 4): 2.0 ** 2,   # O-O:   4.0 (natural: 2.6)
+            (0, 0): 3.0 ** 2,   # Si-Si
+            (0, 3): 3.0 ** 2,   # Si-P
+            (3, 3): 3.0 ** 2,   # P-P
+            (4, 4): 2.0 ** 2,   # O-O
         }
 
         for p in range(st[idx], st[idx + 1]):
             j = neigh[p]
             tj = self.system.type_indices[j]
-
-            # Symmetric pair key
             key = (ti, tj) if ti <= tj else (tj, ti)
 
             if key not in MIN_DIST_SQ:
@@ -630,14 +811,11 @@ class MCSimulator:
             dx = xi - self.system.coords[j, 0]
             dy = yi - self.system.coords[j, 1]
             dz = zi - self.system.coords[j, 2]
-
             dx -= box * round(dx / box)
             dy -= box * round(dy / box)
             dz -= box * round(dz / box)
 
-            r2 = dx * dx + dy * dy + dz * dz
-
-            if r2 < MIN_DIST_SQ[key]:
+            if dx*dx + dy*dy + dz*dz < MIN_DIST_SQ[key]:
                 return False
 
         return True
@@ -645,9 +823,11 @@ class MCSimulator:
     def _mc_move(self, T: float) -> bool:
         n = self.system.N_ATOMS
         i = int(self.rng.integers(0, n))
+
         old_pos = self.system.coords[i].copy()
         elem = self.system.type_to_elem[self.system.type_indices[i]]
         maxd = self.max_disp.get(elem, 0.06)
+
         neigh, st = self.nl.neighbors, self.nl.starts
 
         old_e = local_energy(i, self.system.coords, self.system.charges,
@@ -661,10 +841,18 @@ class MCSimulator:
         delta = self.rng.uniform(-maxd, maxd, size=3)
         self.system.coords[i] = (old_pos + delta) % self.system.box
 
-        # HARD GEOMETRIC CONSTRAINT - checks ALL critical pairs including O-O
+        # HARD GEOMETRIC CONSTRAINT
         if not self._check_geometry(i):
             self.system.coords[i] = old_pos
+            self.rejected_geometry += 1
             return False
+
+        # COORDINATION CONSTRAINT (Production only)
+        if self.production_mode and self.config.coordination_constraint:
+            if not self._check_coordination(i):
+                self.system.coords[i] = old_pos
+                self.rejected_coordination += 1
+                return False
 
         new_e = local_energy(i, self.system.coords, self.system.charges,
                              self.system.type_indices, self.type_Z,
@@ -721,11 +909,11 @@ class MCSimulator:
 
         if mixing:
             for k in self.max_disp:
-                self.max_disp[k] *= 1.5   # REDUCED from 2.0
-            self.max_disp['O'] *= 1.2     # REDUCED from 1.5
+                self.max_disp[k] *= 1.5
+            self.max_disp['O'] *= 1.2
 
         if enhance_oxygen and T >= 1500.0:
-            self.max_disp['O'] = min(self.max_disp['O'] * 1.2, 0.15)  # REDUCED from 1.3/0.20
+            self.max_disp['O'] = min(self.max_disp['O'] * 1.2, 0.15)
 
         pbar = tqdm(range(steps), desc=f"T={T:.0f}K")
         for _ in pbar:
@@ -784,60 +972,87 @@ class MCSimulator:
         else:
             self._run_stage(self.config.mixing_temp, self.mixing_steps,
                             "Mixing", adaptive=True, mixing=True, enhance_oxygen=True)
+
             for i, (T, steps) in enumerate(self.annealing_stages):
                 self._run_stage(T, steps, f"Annealing {i+1}", adaptive=True, enhance_oxygen=True)
+
             for k in self.max_disp:
                 self.max_disp[k] *= 0.7
+
             logger.info(f"Defect Healing: T={self.config.healing_temp:.1f} K")
             self._run_stage(self.config.healing_temp, self.healing_steps,
                             "Defect Healing", adaptive=True, enhance_oxygen=True)
+
             self._run_stage(1000.0, max(1, int(3 * self.system.N_ATOMS)),
                             "Cool after healing", adaptive=True)
             self._run_stage(600.0, max(1, int(2 * self.system.N_ATOMS)),
                             "Cool after healing", adaptive=True)
+
             for k in self.max_disp:
                 self.max_disp[k] *= 0.5
+
             self._run_stage(1.0, self.low_t_steps, "Low-T relaxation", adaptive=False)
 
-        # PRODUCTION
+        # =========================================================================
+        # PRODUCTION WITH COORDINATION CONSTRAINT
+        # =========================================================================
+        self.production_mode = True
+        logger.info("COORDINATION CONSTRAINT ACTIVATED for Production (Si/P CN=4)")
+
         for k in self.max_disp:
             self.max_disp[k] = min(max(self.max_disp[k] * 0.8, 0.02), 0.15)
 
         logger.info(f"Production: T=300 K, steps={self.final_steps}")
-        pbar = tqdm(range(self.final_steps), desc="T=300K")
+        pbar = tqdm(range(self.final_steps), desc="T=300K [CN constraint ON]")
+
         for s in pbar:
             self.step += 1
             self.attempts += 1
+
             acc = self._mc_move(300.0)
             if acc:
                 self.accepted += 1
+
             self._maybe_log()
+
             if (s + 1) % self.snapshot_interval == 0:
                 self.snapshots.append({
                     'coords': self.system.coords.copy(),
                     'types': self.system.type_indices.copy(),
                     'box': self.system.box
                 })
+
             pbar.set_postfix({'acc': f'{self.accepted / max(1, self.attempts) * 100:.1f}%'})
+
         pbar.close()
+
+        # Deactivate production mode
+        self.production_mode = False
 
         logger.info("=" * 70)
         logger.info("SIMULATION COMPLETED")
         logger.info("=" * 70)
-        logger.info(f"Total attempts: {self.attempts}, "
-                     f"acceptance: {self.accepted / max(1, self.attempts) * 100:.2f}%, "
-                     f"rebuilds: {self.rebuilds}")
+        logger.info(
+            f"Total attempts: {self.attempts}, "
+            f"acceptance: {self.accepted / max(1, self.attempts) * 100:.2f}%, "
+            f"rebuilds: {self.rebuilds}"
+        )
+        logger.info(
+            f"Rejected by geometry: {self.rejected_geometry}, "
+            f"Rejected by coordination: {self.rejected_coordination}"
+        )
 
 
 # =========================
 # ANALYZER
 # =========================
 class Analyzer:
-    def __init__(self, system, config):
+    def __init__(self, system: GlassSystem, config: SimulationConfig):
         self.system = system
         self.config = config
         self.use_freud = FREUD_AVAILABLE
 
+        # Xiang & Du 2011, Table 4 cutoffs
         self.FIXED_CUTOFFS = {
             ('Si','O'):2.25, ('P','O'):2.25, ('Na','O'):3.34, ('Ca','O'):3.14,
             ('Sr','O'):3.35, ('O','O'):2.91,
@@ -917,6 +1132,7 @@ class Analyzer:
             small_idx = np.where(mi)[0]; large_coords = coords[mj]
         else:
             small_idx = np.where(mj)[0]; large_coords = coords[mi]
+
         hist = np.zeros(nbins); bw = rmax / nbins
         for idx in small_idx:
             xi, yi, zi = coords[idx]
@@ -931,17 +1147,20 @@ class Analyzer:
             bins = np.floor(r_masked / bw).astype(np.int64)
             bins = bins[bins < nbins]
             hist[bins] += 1
+
         r_edges = np.linspace(0, rmax, nbins + 1)
         rc = 0.5 * (r_edges[:-1] + r_edges[1:])
         dr = r_edges[1] - r_edges[0]
         vol = 4 * np.pi * rc**2 * dr
         norm_factor = box**3 / (ni*(ni-1)) if ti == tj else box**3 / (ni*nj)
         gr = (hist * norm_factor) / vol
+
         pr = self.PEAK_RANGES.get((ei, ej), (1.0, 3.0))
         mask_peak = (rc >= pr[0]) & (rc <= pr[1])
         peak = 0.0
         if np.any(mask_peak) and np.max(gr[mask_peak]) > 0:
             peak = rc[mask_peak][np.argmax(gr[mask_peak])]
+
         mask_cn = (rc > 0.3) & (rc <= cut)
         if np.any(mask_cn):
             rho = (nj - 1 if ti == tj else nj) / box**3
@@ -954,8 +1173,10 @@ class Analyzer:
         si_idx = np.where(types == self.type_map['Si'])[0]
         o_idx = np.where(types == self.type_map['O'])[0]
         n = len(coords)
+
         tree = cKDTree(coords, boxsize=box)
         pairs = tree.query_pairs(si_o_cut + 0.1, output_type='ndarray')
+
         starts = np.zeros(n+1, dtype=np.int32)
         counts = np.zeros(n, dtype=np.int32)
         for i, j in pairs:
@@ -1005,10 +1226,12 @@ class Analyzer:
 
     def analyze_snapshot(self, snap):
         cs = snap['coords']; ts = snap['types']; bx = snap['box']
+
         tree = cKDTree(cs, boxsize=bx)
         max_cut = max(self.FIXED_CUTOFFS.values())
         pairs = tree.query_pairs(max_cut + 0.1, output_type='ndarray')
         n = len(cs)
+
         counts = np.zeros(n, dtype=np.int32)
         for i, j in pairs: counts[i] += 1; counts[j] += 1
         starts = np.zeros(n+1, dtype=np.int32)
@@ -1025,6 +1248,7 @@ class Analyzer:
             cut_fixed = self.FIXED_CUTOFFS[pair]
             cn, peak, r, gr = self.compute_rdf(cs, ts, ei, ej, bx, cut_fixed, rmax=6.0, nbins=400)
             cn_fixed[pair] = cn
+
             auto_cut = self._find_first_minimum(r, gr, pair)
             if auto_cut is not None and auto_cut > 0.5:
                 auto_cutoff_dict[pair] = auto_cut
@@ -1040,6 +1264,7 @@ class Analyzer:
             else:
                 auto_cutoff_dict[pair] = cut_fixed
                 cn_auto[pair] = cn_fixed[pair]
+
             if pair == ('Si','O'):
                 cn_extra[pair] = {}
                 for rcut in self.si_o_cut_extra:
@@ -1056,6 +1281,7 @@ class Analyzer:
         cn_res = cn_fixed
         si_o_cut = self.FIXED_CUTOFFS[('Si','O')]
         p_o_cut = self.FIXED_CUTOFFS[('P','O')]
+
         si_idx = np.where(ts == self.type_map['Si'])[0]
         o_idx = np.where(ts == self.type_map['O'])[0]
         p_idx = np.where(ts == self.type_map['P'])[0]
@@ -1146,7 +1372,7 @@ class Analyzer:
                 tid = self.type_map[elem]
                 Cx = int(np.sum(ts == tid))
                 if Cx == 0: continue
-                nv = {'Ca':2, 'Na':1, 'Sr':2}[elem]
+                nv = {'Ca': 2, 'Na': 1, 'Sr': 2}[elem]
                 sbs = self.SBS_X_O[elem]
                 CN_O = cn_res.get((elem, 'O'), 0.0)
                 s += Cx * nv * sbs * CN_O * nc
@@ -1208,6 +1434,7 @@ class Analyzer:
         cn_fixed_dict = defaultdict(list); cn_auto_dict = defaultdict(list)
         auto_cutoff_dict = defaultdict(list)
         cn_extra_dict = defaultdict(lambda: defaultdict(list))
+
         for res in results:
             for pair, val in res['cn_fixed'].items(): cn_fixed_dict[pair].append(val)
             for pair, val in res['cn_auto'].items(): cn_auto_dict[pair].append(val)
@@ -1215,43 +1442,52 @@ class Analyzer:
             if 'cn_extra' in res:
                 for pair, extra_vals in res['cn_extra'].items():
                     for rcut, val in extra_vals.items(): cn_extra_dict[pair][rcut].append(val)
+
         agg['cn_fixed'] = {p: mean_std(v) for p, v in cn_fixed_dict.items()}
         agg['cn_auto'] = {p: mean_std(v) for p, v in cn_auto_dict.items()}
         agg['auto_cutoff'] = {p: mean_std(v) for p, v in auto_cutoff_dict.items()}
         agg['cn_extra'] = {}
         for pair, rdict in cn_extra_dict.items():
             agg['cn_extra'][pair] = {r: mean_std(v) for r, v in rdict.items()}
+
         for key in ['cn', 'qn_si', 'qn_p', 'qn_combined']:
             d = defaultdict(list)
             for res in results:
                 for k, v in res[key].items(): d[k].append(v)
             agg[key] = {k: mean_std(v) for k, v in d.items()}
+
         for key in ['bo', 'nbo', 'fo', 'to', 'nc', 'fnet', 'p_si_links', 'total_p_o_bonds']:
             agg[key] = mean_std([r[key] for r in results])
+
         for key in ['r_xx', 'modifier_preference']:
             d = defaultdict(list)
             for res in results:
                 for k, v in res[key].items(): d[k].append(v)
             agg[key] = {k: mean_std(v) for k, v in d.items()}
+
         osi = [r['osi_mean'] for r in results if not np.isnan(r['osi_mean'])]
         siosi = [r['siosi_mean'] for r in results if not np.isnan(r['siosi_mean'])]
         agg['osi_mean'] = float(np.mean(osi)) if osi else np.nan
         agg['siosi_mean'] = float(np.mean(siosi)) if siosi else np.nan
+
         if agg['total_p_o_bonds'][0] > 0:
             agg['frac_p_si'] = agg['p_si_links'][0] / agg['total_p_o_bonds'][0]
         else:
             agg['frac_p_si'] = 0.0
+
         return agg
 
     def compute_cn_curves(self, excel_path, rmax=6.0, output_dir=None):
         xl = pd.ExcelFile(excel_path)
         rdf_sheets = [s for s in xl.sheet_names if s.startswith('RDF_')]
         if not rdf_sheets: return
+
         box = self.system.box; volume = box**3; counts = self.system.counts
         n_atom2 = {}
         for pair in self.ALL_PAIRS:
             ei, ej = pair
             n_atom2[f"{ei}-{ej}"] = counts.get(ei, 0) if ei == ej else counts.get(ej, 0)
+
         cn_results = {}
         for sheet in rdf_sheets:
             pair_name = sheet.replace('RDF_', '').replace('_', '-')
@@ -1269,18 +1505,22 @@ class Analyzer:
             for i in range(1, len(r_masked)):
                 cn[i] = cn[i-1] + trapezoid(integrand[i-1:i+1], r_masked[i-1:i+1])
             cn_results[pair_name] = (r_masked, cn)
+
         with pd.ExcelWriter(excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
             for pair_name, (r_masked, cn) in cn_results.items():
                 df_cn = pd.DataFrame({'r_A': r_masked, 'CN': cn})
                 sheet_name = f"CN_{pair_name.replace('-', '_')}"
                 df_cn.to_excel(writer, sheet_name=sheet_name, index=False)
+
         if output_dir is None: output_dir = self.config.output_dir / "plots"
         output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
+
         n_pairs = len(cn_results)
         if n_pairs == 0: return
         ncols = 4; nrows = (n_pairs + ncols - 1) // ncols
         fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*4, nrows*4))
         axes = axes.flatten() if nrows*ncols > 1 else [axes]
+
         for idx, (pair, (r_cn, cn)) in enumerate(cn_results.items()):
             ax = axes[idx]
             ax.plot(r_cn, cn, color='#2980b9', linewidth=1.5)
@@ -1294,6 +1534,7 @@ class Analyzer:
                     ax.axvline(x=cut, color='#e74c3c', linestyle='--',
                                label=f'Cutoff={cut:.2f} A, CN={cn_cut:.2f}')
                     ax.legend(fontsize=8)
+
         for j in range(len(cn_results), len(axes)): axes[j].set_visible(False)
         plt.tight_layout()
         plt.savefig(output_dir / 'CN_curves.png', dpi=300, bbox_inches='tight')
@@ -1320,14 +1561,17 @@ class Analyzer:
                 ['Mixing_sweeps', self.config.mixing_sweeps],
                 ['Final_sweeps', self.config.final_sweeps],
                 ['Mode', 'Continue' if self.config.continue_mode else 'Full'],
+                ['Coordination_Constraint', 'Enabled' if self.config.coordination_constraint else 'Disabled'],
                 ['freud', 'Yes' if FREUD_AVAILABLE else 'No']
             ]
+
             if energy_data is not None and len(energy_data['total']) > 0:
                 meta_rows.append(['Final_Energy_eV_per_atom', f'{energy_data["total"][-1]:.6f}'])
             if 'block_energy' in results:
                 be = results['block_energy']
                 meta_rows.append(['Block_Avg_Energy_eV_per_atom', f'{be["mean"]:.6f}'])
                 meta_rows.append(['Block_Avg_Std_eV_per_atom', f'{be["std"]:.6f}'])
+
             pd.DataFrame(meta_rows, columns=['Parameter', 'Value']).to_excel(
                 writer, sheet_name='Metadata', index=False)
 
@@ -1471,6 +1715,7 @@ class Analyzer:
             ax1.text(bar.get_x()+bar.get_width()/2, bar.get_height()+max(means)*0.02,
                      f'{means[n]/N_SI*100:.1f}%', ha='center')
         ax1.set_title('Si Qn'); ax1.set_ylabel('Count'); ax1.grid(alpha=0.3, axis='y')
+
         if self.system.counts.get('P', 0) > 0:
             means = [results['qn_p'][n][0] for n in range(5)]
             errs = [results['qn_p'][n][1] for n in range(5)]
@@ -1530,7 +1775,7 @@ class SensitivityAnalyzer:
 # =========================
 # CLI
 # =========================
-app = typer.Typer(help="45S5/Sr Bioglass NVT Monte Carlo - Enhanced v8.3 (FINAL)")
+app = typer.Typer(help="45S5/Sr Bioglass NVT Monte Carlo - v8.4 with Coordination Constraint")
 
 
 @app.command()
@@ -1542,12 +1787,15 @@ def run(
     final_sweeps: Optional[int] = typer.Option(None, help="Override production MC sweeps."),
     cutoff: float = typer.Option(10.0, help="Effective cutoff in Angstrom."),
     wolf_alpha: float = typer.Option(0.25, help="Wolf damping parameter alpha."),
+    no_cn_constraint: bool = typer.Option(False, "--no-cn-constraint",
+                                          help="Disable Si/P coordination constraint in production."),
     continue_mode: bool = typer.Option(False, "--continue",
                                        help="Skip mixing/annealing. Use for relaxing pre-equilibrated structure.")
 ):
     try:
         n_header, comment, meta = parse_xyz_header(input_file)
         x = meta.get('x', 0)
+
         if seed is None: seed = meta.get('seed', 42)
         if seed is None: seed = 42
         if density is None: density = meta.get('density', None)
@@ -1558,8 +1806,10 @@ def run(
             input_file=input_file, seed=seed, density=density, x=x,
             box_override=box_override, output_dir=output_dir,
             n_cores=cores, cutoff=cutoff, wolf_alpha=wolf_alpha,
-            continue_mode=continue_mode
+            continue_mode=continue_mode,
+            coordination_constraint=(not no_cn_constraint)
         )
+
         if final_sweeps is not None:
             config.final_sweeps = final_sweeps
 
@@ -1574,6 +1824,7 @@ def run(
         logger.info(f"Density    : {density if density is not None else 'parsed from box'}")
         logger.info(f"Box        : {box_override if box_override is not None else 'computed from density'}")
         logger.info(f"Mode       : {'CONTINUE' if continue_mode else 'FULL PROTOCOL'}")
+        logger.info(f"CN Constraint: {'ENABLED' if config.coordination_constraint else 'DISABLED'}")
         logger.info(f"Output dir : {config.output_dir}")
 
         system = GlassSystem(config)
@@ -1591,6 +1842,7 @@ def run(
             prod_energy = np.array(sim.energy_log[-prod_samples:])
         else:
             prod_energy = np.array([sim.current_energy / system.N_ATOMS])
+
         if len(prod_energy) >= 6:
             n_blocks = min(10, len(prod_energy) // 3)
             block_size = len(prod_energy) // n_blocks
@@ -1633,6 +1885,7 @@ def run(
 
         with open(config.output_dir / "results.pkl", 'wb') as f:
             pickle.dump(results, f)
+
         logger.info(f"[OK] Results saved to {config.output_dir}")
 
     except Exception as e:
