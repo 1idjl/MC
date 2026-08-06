@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 ========================================================================
-45S5/Sr Bioglass NVT Monte Carlo - FINAL v10.0 (ALL-IN-ONE)
+45S5/Mg Bioglass NVT Monte Carlo - FINAL v10.1 (ALL-IN-ONE) (NO Sr)
 Based on: Xiang & Du, Chem. Mater. 2011, 23, 2703-2717
+MANUSCRIPT REFERENCE: Mg Substitution (45-M0 to 45-M20)
 COMPLETE PACKAGE:
 - NVT Monte Carlo simulation (no artificial constraints)
 - Full structural analysis (RDF, CN, Qn, angles, O speciation)
@@ -13,8 +14,8 @@ COMPLETE PACKAGE:
 - Complete Excel export + plots
 
 Usage:
-python Sr.py initial_Sr0.xyz --final-sweeps 150 --cores 12
-python Sr.py final_structure.xyz --continue --final-sweeps 300 --cores 12
+python simulation.py initial_Mg0.xyz --final-sweeps 150 --cores 12
+python simulation.py final_structure.xyz --continue --final-sweeps 300 --cores 12
 ========================================================================
 """
 
@@ -46,16 +47,15 @@ SKIN = 1.5
 SWITCH_DR = 0.3
 BASE_N_ATOMS = 2835
 
-# Paper reference values
+# Paper reference values (Updated for Mg, NO Sr)
 PAPER_BOND_LENGTHS = {('O','O'):2.63, ('Si','O'):1.61, ('Ca','O'):2.38, ('Na','O'):2.40,
-                      ('Sr','O'):2.59, ('Si','Si'):3.16, ('Si','Na'):3.29, ('Si','Ca'):3.64,
-                      ('Mg','O'): 2.1} # Example value, find accurate one if available
-PAPER_CN = {'Ca': 6.2, 'Na': 5.7, 'Sr': 7.0, 'Mg': 6.0} # Example value, find accurate one
+                      ('Mg','O'): 2.1} # Example value from manuscript, find accurate one if available
+PAPER_CN = {'Ca': 6.2, 'Na': 5.7, 'Mg': 6.0} # Example value, find accurate one from manuscript for 45-M5 or relevant composition
 PAPER_QN_SI = {'Q0':3.7, 'Q1':23.2, 'Q2':39.8, 'Q3':27.8, 'Q4':5.6}
 PAPER_QN_P = {'Q0':50.0, 'Q1':42.9, 'Q2':6.4, 'Q3':0.6, 'Q4':0.0}
 PAPER_NC = {'Si': 2.07, 'P': 0.62, 'overall': 1.953} # Example for 45-M5 from manuscript
 
-NEUTRON_B = {'O': 5.803, 'Si': 4.1491, 'Na': 3.63, 'Ca': 4.70, 'Sr': 7.02, 'P': 5.13, 'Mg': 5.378} # Example value
+NEUTRON_B = {'O': 5.803, 'Si': 4.1491, 'Na': 3.63, 'Ca': 4.70, 'P': 5.13, 'Mg': 5.378} # Example value, find accurate one
 
 class SimulationError(Exception): pass
 class FileError(SimulationError): pass
@@ -98,19 +98,19 @@ class Potential:
             ('O','O'): {'A': 2029.2204, 'F': 0.343645, 'C': 192.58},
             ('Na','O'): {'A': 4383.7555, 'F': 0.243838, 'C': 30.70},
             ('Ca','O'): {'A': 7747.1834, 'F': 0.252623, 'C': 93.109},
-            ('Sr','O'): {'A': 14566.637, 'F': 0.245015, 'C': 81.773},
-            ('Mg','O'): {'A': 7063.0, 'F': 0.2109, 'C': 19.21} # Added Mg-O
+            ('Mg','O'): {'A': 7063.0, 'F': 0.2109, 'C': 19.21} # Added Mg-O from manuscript Table 1
         }
         # ZBL parameters (constants)
         self.zbl_a0 = 0.529177210903  # Bohr radius in Angstrom
         self.zbl_c = 14.3996454784255  # e^2 / (4*pi*epsilon_0) in eV*A
         self.zbl_d = 0.885341375986  # sqrt(hbar^2 / (2*m_e)) / a0 in sqrt(eV)*A
-        self.zbl_z = {'Si': 14.0, 'Ca': 20.0, 'Na': 11.0, 'P': 15.0, 'O': 8.0, 'Sr': 38.0, 'Mg': 12.0} # Added Mg Z
+        # Z values for ZBL potential (NO Sr)
+        self.zbl_z = {'Si': 14.0, 'Ca': 20.0, 'Na': 11.0, 'P': 15.0, 'O': 8.0, 'Mg': 12.0} # Sr removed, Mg added
 
         self.r_hard_default = 0.9
         self.r_hard_by_pair = {('O', 'O'): 1.4}
-        # Specific Born-Mayer parameters for surface energy calculation (if needed)
-        self.sbs_x_o = {'Ca': 32.0, 'Na': 20.0, 'Sr': 32.0, 'Mg': 25.0} # Added Mg value
+        # Specific Born-Mayer parameters for surface energy calculation (NO Sr)
+        self.sbs_x_o = {'Ca': 32.0, 'Na': 20.0, 'Mg': 25.0} # Sr removed, Mg added (example value)
 
 # ========================= GLASS SYSTEM =========================
 class GlassSystem:
@@ -135,14 +135,15 @@ class GlassSystem:
 
         self.symbols = symbols
         self.coords = np.array(coords_list, dtype=np.float64)
-        # Updated type map to include Mg
-        self.type_map = {'Si': 0, 'Ca': 1, 'Na': 2, 'P': 3, 'O': 4, 'Sr': 5, 'Mg': 6}
-        self.type_to_elem = {0: 'Si', 1: 'Ca', 2: 'Na', 3: 'P', 4: 'O', 5: 'Sr', 6: 'Mg'}
+        # Updated type map to include Mg, NO Sr
+        self.type_map = {'Si': 0, 'Ca': 1, 'Na': 2, 'P': 3, 'O': 4, 'Mg': 5} # Sr removed, Mg added
+        self.type_to_elem = {0: 'Si', 1: 'Ca', 2: 'Na', 3: 'P', 4: 'O', 5: 'Mg'} # Sr removed, Mg added
         self.type_indices = np.array([self.type_map[s] for s in self.symbols], dtype=np.int32)
         self.counts = {e: int(np.sum(self.type_indices == self.type_map[e])) for e in set(self.symbols)}
         logger.info(f"Composition: {self.counts}")
+        # Masses (NO Sr)
         self.masses = {'Si': 28.0855, 'Ca': 40.078, 'Na': 22.98977,
-                       'P': 30.97376, 'O': 15.999, 'Sr': 87.62, 'Mg': 24.305} # Add Mg mass
+                       'P': 30.97376, 'O': 15.999, 'Mg': 24.305} # Sr removed, Mg added
         self.total_mass = sum(self.masses[s] for s in self.symbols)
 
         self._setup_box()
@@ -170,7 +171,8 @@ class GlassSystem:
 
     def _setup_charges(self):
         """Compute charges based on stoichiometry for neutrality."""
-        base_charges = {'Si': 2.4, 'Ca': 1.2, 'Na': 0.6, 'P': 3.0, 'Sr': 1.2, 'Mg': 1.2} # Add Mg charge
+        # Base charges (NO Sr)
+        base_charges = {'Si': 2.4, 'Ca': 1.2, 'Na': 0.6, 'P': 3.0, 'Mg': 1.2} # Sr removed, Mg added
         # Calculate total positive charge
         total_pos = sum(self.counts.get(e, 0) * base_charges.get(e, 0) for e in self.counts if e != 'O')
         n_o = self.counts.get('O', 0)
@@ -196,8 +198,8 @@ class GlassSystem:
                  logger.debug(f"Element {elem}: Count={count}, Charge={charge_val:.4f}")
 
     def get_type_Z(self):
-        # Return Z values for all possible types (0 to 6)
-        return np.array([self.potential.zbl_z[self.type_to_elem[i]] for i in range(7)], dtype=np.float64) # Index 0 to 6
+        # Return Z values for all possible types (0 to 5), NO Sr
+        return np.array([self.potential.zbl_z[self.type_to_elem[i]] for i in range(6)], dtype=np.float64) # Index 0 to 5
 
 
 # ========================= NEIGHBOR LIST =========================
@@ -382,7 +384,8 @@ class MCSimulator:
         self.attempts = 0
         self.rebuilds = 0
         self.step = 0
-        self.max_disp = {'Si': 0.05, 'Ca': 0.10, 'Na': 0.10, 'P': 0.05, 'O': 0.15, 'Sr': 0.12, 'Mg': 0.10} # Add Mg displacement
+        # Max displacement (NO Sr)
+        self.max_disp = {'Si': 0.05, 'Ca': 0.10, 'Na': 0.10, 'P': 0.05, 'O': 0.15, 'Mg': 0.10} # Sr removed, Mg added
         self.low_t_steps = max(1, int(0.5 * self.system.N_ATOMS))
         self.mixing_steps = max(1, int(1.0 * self.system.N_ATOMS))
         self.final_steps = max(1, int(config.final_sweeps * self.system.N_ATOMS))
@@ -396,10 +399,10 @@ class MCSimulator:
         self.coul_log = []
         self.snapshots = []
 
-        # Build matrices for energy calculation
-        self.A_mat = np.zeros((7, 7), dtype=np.float64) # Updated to 7 types (0-6)
-        self.F_mat = np.zeros((7, 7), dtype=np.float64)
-        self.C_mat = np.zeros((7, 7), dtype=np.float64)
+        # Build matrices for energy calculation (NO Sr)
+        self.A_mat = np.zeros((6, 6), dtype=np.float64) # Updated to 6 types (0-5), NO Sr
+        self.F_mat = np.zeros((6, 6), dtype=np.float64)
+        self.C_mat = np.zeros((6, 6), dtype=np.float64)
         for (e1, e2), p in self.system.potential.buck_params.items():
             t1 = self.system.type_map[e1]
             t2 = self.system.type_map[e2]
@@ -414,7 +417,7 @@ class MCSimulator:
         U, _, _ = energy_decomposition(
             self.system.coords, self.system.charges, self.system.type_indices,
             self.type_Z, self.A_mat, self.F_mat, self.C_mat,
-            np.zeros((7, 7)), # R_HARD not used in decomposition
+            np.zeros((6, 6)), # R_HARD not used in decomposition
             n, s, self.system.box, self.config.cutoff, self.config.wolf_alpha,
             self.system.potential.zbl_a0, self.system.potential.zbl_c, self.system.potential.zbl_d
         )
@@ -458,7 +461,7 @@ class MCSimulator:
                     sr, cl = energy_decomposition(
                         self.system.coords, self.system.charges, self.system.type_indices,
                         self.type_Z, self.A_mat, self.F_mat, self.C_mat,
-                        np.zeros((7, 7)),
+                        np.zeros((6, 6)),
                         n, s, self.system.box, self.config.cutoff, self.config.wolf_alpha,
                         self.system.potential.zbl_a0, self.system.potential.zbl_c, self.system.potential.zbl_d
                     )
@@ -669,49 +672,50 @@ class Analyzer:
         self.config = config
         self.type_map = system.type_map
         self.type_to_elem = system.type_to_elem
-        # Updated CUTOFFS, PEAK_RANGES, MINIMUM_RMIN for Mg interactions (estimates)
+        # Updated CUTOFFS, PEAK_RANGES, MINIMUM_RMIN for Mg interactions, NO Sr (estimates)
         Mg_cutoff_estimate = 2.5 # Rough estimate for Mg-O, adjust if known
         Mg_other_cutoffs = {('Mg', 'O'): Mg_cutoff_estimate,
                             ('Mg', 'Mg'): 3.5, # Rough estimate
                             ('Mg', 'Ca'): 3.2, # Rough estimate
                             ('Mg', 'Na'): 3.0, # Rough estimate
-                            ('Mg', 'Sr'): 3.5, # Rough estimate
                             ('Mg', 'Si'): 3.5, # Rough estimate
                             ('Mg', 'P'): 3.5} # Rough estimate
 
+        # NO Sr in CUTOFFS
         self.CUTOFFS = {('Si','O'):2.25, ('P','O'):2.25, ('Na','O'):3.34, ('Ca','O'):3.14,
-                   ('Sr','O'):3.35, ('O','O'):2.91,
-                   ('P','Ca'):4.44, ('P','Na'):4.44, ('P','Sr'):4.58,
-                   ('Si','Ca'):4.37, ('Si','Na'):4.42, ('Si','Sr'):4.51,
-                   ('Ca','Ca'):4.85, ('Na','Na'):4.15, ('Sr','Sr'):5.14,
-                   ('Ca','Na'):4.94, ('Ca','Sr'):5.00, ('Na','Sr'):4.40,
+                   ('O','O'):2.91,
+                   ('P','Ca'):4.44, ('P','Na'):4.44,
+                   ('Si','Ca'):4.37, ('Si','Na'):4.42,
+                   ('Ca','Ca'):4.85, ('Na','Na'):4.15,
+                   ('Ca','Na'):4.94,
                    # Add Mg cutoffs
                    **Mg_other_cutoffs
                   }
 
+        # NO Sr in PEAK_RANGES
         self.PEAK_RANGES = {('Si','O'):(1.40,2.00), ('P','O'):(1.30,1.90), ('Na','O'):(2.00,2.80),
-                   ('Ca','O'):(2.00,2.80), ('Sr','O'):(2.20,3.00), ('O','O'):(2.30,3.10),
+                   ('Ca','O'):(2.00,2.80), ('O','O'):(2.30,3.10),
                    ('Si','Si'):(2.80,3.60), ('Si','P'):(2.70,3.40), ('P','P'):(2.70,3.40),
-                   ('Si','Na'):(2.90,3.70), ('Si','Ca'):(3.20,4.10), ('Si','Sr'):(3.20,4.10),
-                   ('Na','Na'):(2.50,3.50), ('Ca','Ca'):(3.20,4.20), ('Sr','Sr'):(3.50,4.50),
-                   ('Ca','Na'):(3.00,4.00), ('Ca','Sr'):(3.20,4.20), ('Na','Sr'):(3.00,4.00),
-                   ('P','Ca'):(3.20,4.20), ('P','Na'):(3.00,4.00), ('P','Sr'):(3.20,4.20),
+                   ('Si','Na'):(2.90,3.70), ('Si','Ca'):(3.20,4.10),
+                   ('Na','Na'):(2.50,3.50), ('Ca','Ca'):(3.20,4.20),
+                   ('Ca','Na'):(3.00,4.00),
+                   ('P','Ca'):(3.20,4.20), ('P','Na'):(3.00,4.00),
                    # Add Mg peak ranges (estimates)
                    ('Mg','O'):(1.8, 2.6), # Estimate
                    ('Mg','Mg'):(2.5, 3.5), # Estimate
                    ('Mg','Ca'):(2.8, 4.0), # Estimate
                    ('Mg','Na'):(2.5, 3.5), # Estimate
-                   ('Mg','Sr'):(3.0, 4.0), # Estimate
                    ('Mg','Si'):(3.0, 4.0), # Estimate
                    ('Mg','P'):(3.0, 4.0)  # Estimate
                   }
 
+        # NO Sr in MINIMUM_RMIN
         self.MINIMUM_RMIN = {('Si','O'):1.4, ('P','O'):1.3, ('Na','O'):2.0, ('Ca','O'):2.0,
-                    ('Sr','O'):2.2, ('O','O'):2.2,
-                    ('P','Ca'):3.5, ('P','Na'):3.5, ('P','Sr'):3.5,
-                    ('Si','Ca'):3.5, ('Si','Na'):3.0, ('Si','Sr'):3.5,
-                    ('Ca','Ca'):3.5, ('Na','Na'):3.0, ('Sr','Sr'):4.0,
-                    ('Ca','Na'):3.5, ('Ca','Sr'):4.0, ('Na','Sr'):3.5,
+                    ('O','O'):2.2,
+                    ('P','Ca'):3.5, ('P','Na'):3.5,
+                    ('Si','Ca'):3.5, ('Si','Na'):3.0,
+                    ('Ca','Ca'):3.5, ('Na','Na'):3.0,
+                    ('Ca','Na'):3.5,
                     # Add Mg Rmin (estimates)
                     ('Mg','O'): 1.8, # Estimate
                     ('Mg','Mg'): 2.5, # Estimate
@@ -731,7 +735,7 @@ class Analyzer:
         # --- 2. RDF & CN ---
         results = {}
         modifier_cn = {}
-        for mod in ['Na', 'Ca', 'Sr', 'Mg']: # Include Mg
+        for mod in ['Na', 'Ca', 'Mg']: # Include Mg, removed Sr
             if self.type_map[mod] not in types: continue
             ti = self.type_map[mod]
             tj = self.type_map['O']
@@ -760,7 +764,7 @@ class Analyzer:
 
         # --- 6. Clustering (Rxx) ---
         rxx_results = {}
-        for mod in ['Ca', 'Na', 'Sr', 'Mg']: # Include Mg
+        for mod in ['Ca', 'Na', 'Mg']: # Include Mg, removed Sr
              if self.type_map[mod] not in types: continue
              rxx, obs_cn, hom_cn = self.compute_clustering_rxx(coords, types, mod, box)
              rxx_results[mod] = (rxx, obs_cn, hom_cn)
@@ -1081,7 +1085,7 @@ class Analyzer:
 
         # --- Plot Modifier CN ---
         fig, ax = plt.subplots(figsize=(8, 6))
-        mods = [m for m in ['Na', 'Ca', 'Sr', 'Mg'] if m in results.get('modifier_cn', {})]
+        mods = [m for m in ['Na', 'Ca', 'Mg'] if m in results.get('modifier_cn', {})] # Removed Sr
         if mods:
             cn_means = [results['modifier_cn'][m][0] for m in mods]
             cn_stds = [results['modifier_cn'][m][1] for m in mods]
@@ -1162,18 +1166,19 @@ class Analyzer:
 class SensitivityAnalyzer:
     def __init__(self, system, config):
         self.system = system; self.config = config; self.pot = system.potential
-        self.A_mat = np.zeros((7, 7), dtype=np.float64) # Updated to 7 types
-        self.F_mat = np.zeros((7, 7), dtype=np.float64)
-        self.C_mat = np.zeros((7, 7), dtype=np.float64)
+        # NO Sr in matrices
+        self.A_mat = np.zeros((6, 6), dtype=np.float64) # Updated to 6 types, NO Sr
+        self.F_mat = np.zeros((6, 6), dtype=np.float64)
+        self.C_mat = np.zeros((6, 6), dtype=np.float64)
         # R_HARD is not typically used in the main energy calculation with ZBL+Buckingham+Coulomb, so initialized to zero or ignored.
         # If used, initialize similarly to A/F/C mats.
-        self.R_HARD_MAT = np.zeros((7, 7), dtype=np.float64) # Placeholder if needed elsewhere
+        self.R_HARD_MAT = np.zeros((6, 6), dtype=np.float64) # Placeholder if needed elsewhere
         for (e1, e2), p in self.pot.buck_params.items():
             t1 = self.system.type_map[e1]; t2 = self.system.type_map[e2]
             self.A_mat[t1, t2] = p['A']; self.F_mat[t1, t2] = p['F']; self.C_mat[t1, t2] = p['C']
             if t1 != t2: # Symmetrize
                 self.A_mat[t2, t1] = p['A']; self.F_mat[t2, t1] = p['F']; self.C_mat[t2, t1] = p['C']
-        self.type_Z = self.system.get_type_Z() # Gets Z for types 0-6
+        self.type_Z = self.system.get_type_Z() # Gets Z for types 0-5, NO Sr
 
     def run(self):
         logger.info("=" * 70)
@@ -1301,7 +1306,7 @@ class SimulationConfig:
 def print_summary(results, x_val):
     print("")
     print("=" * 70)
-    print(f" ANALYSIS SUMMARY - 45S5 + {x_val} mol% MgO") # Updated label
+    print(f" ANALYSIS SUMMARY - 45S5 + {x_val} mol% MgO") # Updated label, removed Sr
     print("=" * 70)
 
     md = results['metadata']
@@ -1358,14 +1363,14 @@ def print_summary(results, x_val):
 
 
 # ========================= CLI =========================
-app = typer.Typer(help="45S5/Mg Bioglass NVT MC v10.0 - ALL-IN-ONE (Simulation + Analysis)")
+app = typer.Typer(help="45S5/Mg Bioglass NVT MC v10.1 - ALL-IN-ONE (Simulation + Analysis) (NO Sr)") # Updated help, removed Sr
 
 @app.command()
 def run(
     input_file: Path = typer.Argument(..., help="Input XYZ file generated by structure_generator_paper.py"),
     seed: Optional[int] = typer.Option(None, help="Random seed. If omitted, read from XYZ comment."),
     density: Optional[float] = typer.Option(None, help="Optional density override in g/cm^3."),
-    x: Optional[float] = typer.Option(None, help="Mg mol% (read from XYZ if not provided)."), # Updated help
+    x: Optional[float] = typer.Option(None, help="Mg mol% (read from XYZ if not provided)."), # Updated help, removed Sr
     cores: int = typer.Option(4, help="Number of CPU cores for analysis."),
     cutoff: float = typer.Option(10.0, help="Real space cutoff (A)."),
     wolf_alpha: float = typer.Option(0.25, help="Wolf summation alpha parameter."),
@@ -1396,7 +1401,7 @@ def run(
         logger.info("INPUT")
         logger.info("=" * 70)
         logger.info(f"File        : {input_file}")
-        logger.info(f"x (Mg mol%) : {x}") # Updated label
+        logger.info(f"x (Mg mol%) : {x}") # Updated label, removed Sr
         logger.info(f"N atoms     : {n_header}")
         logger.info(f"Seed        : {seed}")
         logger.info(f"Density     : {density or 'Not specified (will use from XYZ or fail)'}")
@@ -1423,7 +1428,7 @@ def run(
         xyz_path = config.output_dir / "final_structure.xyz"
         with open(xyz_path, 'w') as f:
             f.write(f"{system.N_ATOMS}\n")
-            f.write(f"Final Xiang-Du 2011, x={config.x} mol% MgO, " # Updated label
+            f.write(f"Final Xiang-Du 2011, x={config.x} mol% MgO, " # Updated label, removed Sr
                     f"N={system.N_ATOMS}, rho={system.effective_density:.4f} g/cm3, "
                     f"box={system.box:.4f} A, seed={config.seed}\n")
             for i in range(system.N_ATOMS):
@@ -1464,12 +1469,12 @@ def run(
         molar_volume = (total_mass / approx_oxide_units) / eff_density if approx_oxide_units > 0 else np.nan
 
         results['metadata'] = {
-            'x_mol_percent_MgO': x, # Store the x value used
+            'x_mol_percent_MgO': x, # Store the x value used, removed Sr label
             'N_atoms': system.N_ATOMS,
             'Box_A': box,
             'Density_g_cm3': eff_density,
             'Molar_volume_cm3_mol': molar_volume,
-            **{f'N_{e}': counts.get(e, 0) for e in ['Si', 'P', 'Na', 'Ca', 'Sr', 'O', 'Mg']} # Include all counts
+            **{f'N_{e}': counts.get(e, 0) for e in ['Si', 'P', 'Na', 'Ca', 'O', 'Mg']} # Include all counts, removed Sr
         }
 
 
