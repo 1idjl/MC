@@ -200,7 +200,7 @@ class SimulationConfig:
     final_sweeps: int = 30
 
     snapshot_interval: Optional[int] = None
-    max_snapshots: int = 30
+    max_snapshots: int = 50
 
     cutoff: float = 10.0
     wolf_alpha: float = 0.25

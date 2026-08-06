@@ -847,3 +847,4 @@ if __name__ == "__main__":
         args.seed,
         args.scale
     )
+    
