@@ -1,0 +1,47 @@
+# =========================================================
+# 45-M0 (0 mol% MgO)
+# =========================================================
+python structure_generator_paper_mg.py --mg 0 --scale 4 --seed 42
+python simulation_mg.py initial_Mg0.xyz --final-sweeps 150 --cores 12
+
+# =========================================================
+# 45-M1 (1 mol% MgO)
+# =========================================================
+python structure_generator_paper_mg.py --mg 1 --scale 4 --seed 42
+python simulation_mg.py initial_Mg1.xyz --final-sweeps 150 --cores 12
+
+# =========================================================
+# 45-M3 (3 mol% MgO)
+# =========================================================
+python structure_generator_paper_mg.py --mg 3 --scale 4 --seed 42
+python simulation_mg.py initial_Mg3.xyz --final-sweeps 150 --cores 12
+
+# =========================================================
+# 45-M5 (5 mol% MgO) - ترکیب بهینه مقاله
+# =========================================================
+python structure_generator_paper_mg.py --mg 5 --scale 4 --seed 42
+python simulation_mg.py initial_Mg5.xyz --final-sweeps 150 --cores 12
+
+# =========================================================
+# 45-M8 (8 mol% MgO)
+# =========================================================
+python structure_generator_paper_mg.py --mg 8 --scale 4 --seed 42
+python simulation_mg.py initial_Mg8.xyz --final-sweeps 150 --cores 12
+
+# =========================================================
+# 45-M10 (10 mol% MgO)
+# =========================================================
+python structure_generator_paper_mg.py --mg 10 --scale 4 --seed 42
+python simulation_mg.py initial_Mg10.xyz --final-sweeps 150 --cores 12
+
+# =========================================================
+# 45-M15 (15 mol% MgO)
+# =========================================================
+python structure_generator_paper_mg.py --mg 15 --scale 4 --seed 42
+python simulation_mg.py initial_Mg15.xyz --final-sweeps 150 --cores 12
+
+# =========================================================
+# 45-M20 (20 mol% MgO)
+# =========================================================
+python structure_generator_paper_mg.py --mg 20 --scale 4 --seed 42
+python simulation_mg.py initial_Mg20.xyz --final-sweeps 150 --cores 12
