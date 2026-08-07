@@ -32,3 +32,36 @@ python simulation_mg.py initial_Mg20.xyz --final-sweeps 50000 --cores 12
 
 
 python analyze_mg_final.py Bioglass_Mg5_N11340_seed42/final_structure.xyz --energy-log Bioglass_Mg5_N11340_seed42/energy_log.csv
+
+
+# ===================== 45-M0 (density: 2.673801) =====================
+python structure_generator_paper_mg.py --mg 0 --scale 4 --seed 42
+python simulation_mg.py initial_Mg0.xyz --final-sweeps 50000 --cores 12
+
+# ===================== 45-M1 (density: 2.654335) =====================
+python structure_generator_paper_mg.py --mg 1 --scale 4 --seed 42
+python simulation_mg.py initial_Mg1.xyz --final-sweeps 50000 --cores 12
+
+# ===================== 45-M3 (density: 2.638811) =====================
+python structure_generator_paper_mg.py --mg 3 --scale 4 --seed 42
+python simulation_mg.py initial_Mg3.xyz --final-sweeps 50000 --cores 12
+
+# ===================== 45-M5 (density: 2.629815) =====================
+python structure_generator_paper_mg.py --mg 5 --scale 4 --seed 42
+python simulation_mg.py initial_Mg5.xyz --final-sweeps 50000 --cores 12
+
+# ===================== 45-M8 (density: 2.618935) =====================
+python structure_generator_paper_mg.py --mg 8 --scale 4 --seed 42
+python simulation_mg.py initial_Mg8.xyz --final-sweeps 50000 --cores 12
+
+# ===================== 45-M10 (density: 2.614384) =====================
+python structure_generator_paper_mg.py --mg 10 --scale 4 --seed 42
+python simulation_mg.py initial_Mg10.xyz --final-sweeps 50000 --cores 12
+
+# ===================== 45-M15 (density: 2.584558) =====================
+python structure_generator_paper_mg.py --mg 15 --scale 4 --seed 42
+python simulation_mg.py initial_Mg15.xyz --final-sweeps 50000 --cores 12
+
+# ===================== 45-M20 (density: 2.550217) =====================
+python structure_generator_paper_mg.py --mg 20 --scale 4 --seed 42
+python simulation_mg.py initial_Mg20.xyz --final-sweeps 50000 --cores 12
