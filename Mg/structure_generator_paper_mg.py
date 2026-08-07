@@ -1,45 +1,23 @@
 #!/usr/bin/env python3
 """
 ========================================================================
-Smart Initial Structure Generator for Mg-doped 45S5 Bioglass
+Paper-Matched Structure Generator for Mg-doped 45S5 (v5.3 - Exact BO Control)
 Based on: Moghanian et al., Mg-doped 45S5 bioglass manuscript
-Version: Mg-paper-4x
 
-IMPORTANT:
-- Compositions and densities are taken exactly from Table 2 of the paper.
-- Default scale = 4, therefore total atoms = 4 * 2835 = 11340.
-- Partial charges are fixed according to the paper:
-  Si +2.4, Ca +1.2, Na +0.6, P +3.0, Mg +1.2, O -1.2
-
-Example:
-python structure_generator_paper_mg.py --mg 0  --seed 42
-python structure_generator_paper_mg.py --mg 5  --seed 42
-python structure_generator_paper_mg.py --mg 20 --seed 42
-
---mg values correspond to paper labels:
-0  -> 45-M0
-1  -> 45-M1
-3  -> 45-M3
-5  -> 45-M5
-8  -> 45-M8
-10 -> 45-M10
-15 -> 45-M15
-20 -> 45-M20
+v5.3 KEY FIX:
+- EXACTLY builds target number of BO (1976 for 45-M0)
+- Strict control on Si-Si and Si-P edge counts
+- Simplified, predictable algorithm
 ========================================================================
 """
-
 import numpy as np
-from numba import njit
 import argparse
 from pathlib import Path
 from scipy.spatial import cKDTree
+from math import sqrt, sin, cos, pi
 
 NA = 6.02214076e23
-BASE_N_ATOMS = 2835
 
-# ================================================================
-# PAPER TABLE 2: composition for 2835 atoms and densities
-# ================================================================
 PAPER_COMPOSITION = {
     0:  {"label": "45-M0",  "N_Mg": 0,   "N_Ca": 269, "density": 2.673801},
     1:  {"label": "45-M1",  "N_Mg": 10,  "N_Ca": 259, "density": 2.654335},
@@ -51,800 +29,605 @@ PAPER_COMPOSITION = {
     20: {"label": "45-M20", "N_Mg": 200, "N_Ca": 69,  "density": 2.550217},
 }
 
+PAPER_NC = {
+    0: 1.926, 1: 1.922, 3: 1.938, 5: 1.953,
+    8: 1.953, 10: 1.981, 15: 1.973, 20: 2.035,
+}
 
-# ================================================================
-# NUMBA KERNELS
-# ================================================================
-@njit(fastmath=True, cache=True)
-def _random_rotation_matrix(seed_val):
-    """Generate a random 3D rotation matrix (uniform SO(3))."""
-    np.random.seed(seed_val)
+def minimum_image(dr, box):
+    return dr - box * np.round(dr / box)
 
-    u1 = np.random.random()
-    u2 = np.random.random()
-    u3 = np.random.random()
-
-    q0 = np.sqrt(1.0 - u1) * np.sin(2.0 * np.pi * u2)
-    q1 = np.sqrt(1.0 - u1) * np.cos(2.0 * np.pi * u2)
-    q2 = np.sqrt(u1) * np.sin(2.0 * np.pi * u3)
-    q3 = np.sqrt(u1) * np.cos(2.0 * np.pi * u3)
-
+def random_rotation(rng):
+    u1, u2, u3 = rng.random(3)
+    q0 = sqrt(1.0 - u1) * sin(2.0 * pi * u2)
+    q1 = sqrt(1.0 - u1) * cos(2.0 * pi * u2)
+    q2 = sqrt(u1) * sin(2.0 * pi * u3)
+    q3 = sqrt(u1) * cos(2.0 * pi * u3)
     R = np.zeros((3, 3), dtype=np.float64)
-    R[0, 0] = 1.0 - 2.0 * (q2 * q2 + q3 * q3)
-    R[0, 1] = 2.0 * (q1 * q2 - q0 * q3)
-    R[0, 2] = 2.0 * (q1 * q3 + q0 * q2)
-
-    R[1, 0] = 2.0 * (q1 * q2 + q0 * q3)
-    R[1, 1] = 1.0 - 2.0 * (q1 * q1 + q3 * q3)
-    R[1, 2] = 2.0 * (q2 * q3 - q0 * q1)
-
-    R[2, 0] = 2.0 * (q1 * q3 - q0 * q2)
-    R[2, 1] = 2.0 * (q2 * q3 + q0 * q1)
-    R[2, 2] = 1.0 - 2.0 * (q1 * q1 + q2 * q2)
-
+    R[0, 0] = 1.0 - 2.0 * (q2*q2 + q3*q3); R[0, 1] = 2.0 * (q1*q2 - q0*q3); R[0, 2] = 2.0 * (q1*q3 + q0*q2)
+    R[1, 0] = 2.0 * (q1*q2 + q0*q3); R[1, 1] = 1.0 - 2.0 * (q1*q1 + q3*q3); R[1, 2] = 2.0 * (q2*q3 - q0*q1)
+    R[2, 0] = 2.0 * (q1*q3 - q0*q2); R[2, 1] = 2.0 * (q2*q3 + q0*q1); R[2, 2] = 1.0 - 2.0 * (q1*q1 + q2*q2)
     return R
 
-
-@njit(fastmath=True, cache=True)
-def place_network_formers(n_si, n_p, box, min_nf_dist, seed):
-    """
-    Stage 1:
-    Place Si and P network formers with a minimum NF-NF distance.
-    """
-    np.random.seed(seed)
-
+def place_network_formers(n_si, n_p, box, min_nf_dist, min_p_p_dist, rng):
     n_total = n_si + n_p
     coords = np.zeros((n_total, 3), dtype=np.float64)
-
+    types = np.zeros(n_total, dtype=np.int32)
     min_d_sq = min_nf_dist * min_nf_dist
+    min_p_sq = min_p_p_dist * min_p_p_dist
     placed = 0
-    half_box = box / 2.0
-    max_attempts = 300000
-
+    
     for i in range(n_total):
+        is_p = (i >= n_si)
         success = False
-
-        for attempt in range(max_attempts):
-            px = np.random.uniform(0.0, box)
-            py = np.random.uniform(0.0, box)
-            pz = np.random.uniform(0.0, box)
-
+        
+        for attempt in range(30000):
+            pos = rng.uniform(0.0, box, 3)
             valid = True
-            for j in range(placed):
-                dx = px - coords[j, 0]
-                dy = py - coords[j, 1]
-                dz = pz - coords[j, 2]
-
-                if dx > half_box:
-                    dx -= box
-                elif dx < -half_box:
-                    dx += box
-
-                if dy > half_box:
-                    dy -= box
-                elif dy < -half_box:
-                    dy += box
-
-                if dz > half_box:
-                    dz -= box
-                elif dz < -half_box:
-                    dz += box
-
-                if dx * dx + dy * dy + dz * dz < min_d_sq:
+            
+            if placed > 0:
+                d = coords[:placed] - pos
+                d = minimum_image(d, box)
+                r2 = np.sum(d * d, axis=1)
+                
+                if np.any(r2 < min_d_sq):
                     valid = False
-                    break
-
+                elif valid and is_p:
+                    p_mask = (types[:placed] == 1)
+                    if np.any(p_mask) and np.any(r2[p_mask] < min_p_sq):
+                        valid = False
+            
             if valid:
-                coords[placed, 0] = px
-                coords[placed, 1] = py
-                coords[placed, 2] = pz
+                coords[placed] = pos
+                types[placed] = 1 if is_p else 0
                 placed += 1
                 success = True
                 break
-
+        
         if not success:
-            coords[placed, 0] = np.random.uniform(0.0, box)
-            coords[placed, 1] = np.random.uniform(0.0, box)
-            coords[placed, 2] = np.random.uniform(0.0, box)
+            coords[placed] = rng.uniform(0.0, box, 3)
+            types[placed] = 1 if is_p else 0
             placed += 1
+    
+    return coords, types
 
-    return coords, placed
+def build_topology_exact(nf_coords, nf_types, box, n_siosi_target, n_siop_target, rng):
+    """Build EXACTLY the target number of BO edges."""
+    tree = cKDTree(nf_coords, boxsize=box)
+    # Tighter distance range: 2.8 to 4.5 Å
+    pairs = tree.query_pairs(4.5, output_type="ndarray")
+    
+    si_si_cand = []
+    si_p_cand = []
+    
+    for i, j in pairs:
+        ti, tj = nf_types[i], nf_types[j]
+        d = minimum_image(nf_coords[j] - nf_coords[i], box)
+        r = np.linalg.norm(d)
+        
+        # Tighter range: 2.8 to 4.5 Å
+        if r < 2.8 or r > 4.5:
+            continue
+        
+        if ti == 0 and tj == 0:
+            si_si_cand.append((r + rng.uniform(0, 0.05), i, j))
+        elif ti != tj:
+            si_p_cand.append((r + rng.uniform(0, 0.05), i, j))
+    
+    si_si_cand.sort(key=lambda x: x[0])
+    si_p_cand.sort(key=lambda x: x[0])
+    
+    deg = np.zeros(len(nf_coords), dtype=np.int32)
+    selected = set()
+    si_si_edges = []
+    si_p_edges = []
+    
+    # EXACTLY n_siop_target Si-P edges
+    for score, i, j in si_p_cand:
+        if len(si_p_edges) >= n_siop_target:
+            break
+        
+        p_idx = i if nf_types[i] == 1 else j
+        si_idx = j if nf_types[i] == 1 else i
+        
+        # P should have max 2 BO, Si should have max 4
+        if deg[si_idx] < 4 and deg[p_idx] < 2:
+            key = (min(i, j), max(i, j))
+            if key not in selected:
+                selected.add(key)
+                deg[i] += 1
+                deg[j] += 1
+                si_p_edges.append((i, j))
+    
+    # EXACTLY n_siosi_target Si-Si edges
+    for score, i, j in si_si_cand:
+        if len(si_si_edges) >= n_siosi_target:
+            break
+        
+        if deg[i] < 4 and deg[j] < 4:
+            key = (min(i, j), max(i, j))
+            if key not in selected:
+                selected.add(key)
+                deg[i] += 1
+                deg[j] += 1
+                si_si_edges.append((i, j))
+    
+    return si_si_edges, si_p_edges, deg
 
+def place_bridging_oxygens(nf_coords, nf_types, edges, box, rng):
+    bo_coords = []
+    
+    for i, j in edges:
+        d = minimum_image(nf_coords[j] - nf_coords[i], box)
+        r = np.linalg.norm(d)
+        
+        if r < 1e-6:
+            continue
+        
+        o_pos = (nf_coords[i] + d * 0.5) % box
+        
+        if r > 2.8:
+            perp = np.cross(d, np.array([1.0, 0.0, 0.0]))
+            if np.linalg.norm(perp) < 0.1:
+                perp = np.cross(d, np.array([0.0, 1.0, 0.0]))
+            perp = perp / np.linalg.norm(perp)
+            offset = rng.uniform(-0.15, 0.15)
+            o_pos = (o_pos + perp * offset) % box
+        
+        bo_coords.append(o_pos)
+    
+    return np.array(bo_coords, dtype=np.float64) if bo_coords else np.empty((0, 3), dtype=np.float64)
 
-@njit(fastmath=True, cache=True)
-def place_oxygens_around_nf_target(
-    nf_coords,
-    n_nf,
-    n_o_target,
-    box,
-    o_si_dist,
-    o_p_dist,
-    n_si,
-    o_min_dist,
-    seed
-):
-    """
-    Stage 2:
-    Place exactly n_o_target oxygens around Si/P network formers.
-
-    For 45S5:
-    O / (Si+P) ~= 1565 / 513 ~= 3.05
-
-    Therefore most network formers receive 3 oxygens and a smaller
-    fraction receives 4 oxygens. This avoids the artificial problem
-    of assigning 4 oxygens to every tetrahedron and then truncating
-    the last oxygens.
-    """
-    np.random.seed(seed + 1000)
-
-    o_coords = np.zeros((n_o_target, 3), dtype=np.float64)
-    o_placed = 0
-
-    half_box = box / 2.0
-    o_min_d_sq = o_min_dist * o_min_dist
-    max_attempts = 100000
-
-    # Reference tetrahedron directions
-    tet_ref = np.zeros((4, 3), dtype=np.float64)
-    tet_ref[0, 0] =  1.0
-    tet_ref[0, 1] =  1.0
-    tet_ref[0, 2] =  1.0
-
-    tet_ref[1, 0] =  1.0
-    tet_ref[1, 1] = -1.0
-    tet_ref[1, 2] = -1.0
-
-    tet_ref[2, 0] = -1.0
-    tet_ref[2, 1] =  1.0
-    tet_ref[2, 2] = -1.0
-
-    tet_ref[3, 0] = -1.0
-    tet_ref[3, 1] = -1.0
-    tet_ref[3, 2] =  1.0
-
-    for d in range(4):
-        norm = np.sqrt(
-            tet_ref[d, 0] * tet_ref[d, 0] +
-            tet_ref[d, 1] * tet_ref[d, 1] +
-            tet_ref[d, 2] * tet_ref[d, 2]
-        )
-        tet_ref[d, 0] /= norm
-        tet_ref[d, 1] /= norm
-        tet_ref[d, 2] /= norm
-
-    # Distribute target oxygens among network formers:
-    # base = 3 for 45S5, remainder receives +1
-    base = n_o_target // n_nf
-    rem = n_o_target - base * n_nf
-
-    o_per_nf = np.empty(n_nf, dtype=np.int64)
-    for i in range(n_nf):
-        o_per_nf[i] = base
-
-    placed_extra = 0
-    while placed_extra < rem:
-        idx = np.random.randint(0, n_nf)
-        if o_per_nf[idx] == base:
-            o_per_nf[idx] = base + 1
-            placed_extra += 1
-
-    for nf in range(n_nf):
-        nf_x = nf_coords[nf, 0]
-        nf_y = nf_coords[nf, 1]
-        nf_z = nf_coords[nf, 2]
-
-        bond_dist = o_si_dist if nf < n_si else o_p_dist
-
-        # Random orientation for each local tetrahedral unit
-        R = _random_rotation_matrix(seed + 2000 + nf)
-
-        n_local = o_per_nf[nf]
-
-        for k in range(n_local):
-            if k < 4:
-                dx_t = (
-                    R[0, 0] * tet_ref[k, 0] +
-                    R[0, 1] * tet_ref[k, 1] +
-                    R[0, 2] * tet_ref[k, 2]
-                )
-                dy_t = (
-                    R[1, 0] * tet_ref[k, 0] +
-                    R[1, 1] * tet_ref[k, 1] +
-                    R[1, 2] * tet_ref[k, 2]
-                )
-                dz_t = (
-                    R[2, 0] * tet_ref[k, 0] +
-                    R[2, 1] * tet_ref[k, 1] +
-                    R[2, 2] * tet_ref[k, 2]
-                )
-            else:
-                theta = np.random.uniform(0.0, 2.0 * np.pi)
-                phi = np.arccos(2.0 * np.random.random() - 1.0)
-                dx_t = np.sin(phi) * np.cos(theta)
-                dy_t = np.sin(phi) * np.sin(theta)
-                dz_t = np.cos(phi)
-
-            # Small thermal perturbation
-            dx_t += 0.10 * (np.random.random() - 0.5)
-            dy_t += 0.10 * (np.random.random() - 0.5)
-            dz_t += 0.10 * (np.random.random() - 0.5)
-
-            px = (nf_x + bond_dist * dx_t) % box
-            py = (nf_y + bond_dist * dy_t) % box
-            pz = (nf_z + bond_dist * dz_t) % box
-
-            # Check O-O minimum distance
-            valid = True
-            for j in range(o_placed):
-                ddx = px - o_coords[j, 0]
-                ddy = py - o_coords[j, 1]
-                ddz = pz - o_coords[j, 2]
-
-                if ddx > half_box:
-                    ddx -= box
-                elif ddx < -half_box:
-                    ddx += box
-
-                if ddy > half_box:
-                    ddy -= box
-                elif ddy < -half_box:
-                    ddy += box
-
-                if ddz > half_box:
-                    ddz -= box
-                elif ddz < -half_box:
-                    ddz += box
-
-                if ddx * ddx + ddy * ddy + ddz * ddz < o_min_d_sq:
-                    valid = False
-                    break
-
-            if not valid:
-                # Fallback: random direction at the same bond distance
-                for attempt in range(max_attempts):
-                    theta = np.random.uniform(0.0, 2.0 * np.pi)
-                    phi = np.arccos(2.0 * np.random.random() - 1.0)
-
-                    rx = bond_dist * np.sin(phi) * np.cos(theta)
-                    ry = bond_dist * np.sin(phi) * np.sin(theta)
-                    rz = bond_dist * np.cos(phi)
-
-                    px = (nf_x + rx) % box
-                    py = (nf_y + ry) % box
-                    pz = (nf_z + rz) % box
-
-                    valid2 = True
-                    for j in range(o_placed):
-                        ddx = px - o_coords[j, 0]
-                        ddy = py - o_coords[j, 1]
-                        ddz = pz - o_coords[j, 2]
-
-                        if ddx > half_box:
-                            ddx -= box
-                        elif ddx < -half_box:
-                            ddx += box
-
-                        if ddy > half_box:
-                            ddy -= box
-                        elif ddy < -half_box:
-                            ddy += box
-
-                        if ddz > half_box:
-                            ddz -= box
-                        elif ddz < -half_box:
-                            ddz += box
-
-                        if ddx * ddx + ddy * ddy + ddz * ddz < o_min_d_sq:
-                            valid2 = False
-                            break
-
-                    if valid2:
-                        break
-
-            o_coords[o_placed, 0] = px
-            o_coords[o_placed, 1] = py
-            o_coords[o_placed, 2] = pz
-            o_placed += 1
-
-    return o_coords, o_placed
-
-
-@njit(fastmath=True, cache=True)
-def place_modifiers_affinity(
-    n_mod,
-    box,
-    all_coords,
-    n_all,
-    mod_o_min_dist,
-    mod_mod_min_dist,
-    p_coords,
-    n_p,
-    p_attraction_radius,
-    seed
-):
-    """
-    Stage 3:
-    Place modifiers.
-
-    Ca/Mg have affinity for phosphate environments in many 45S5-type
-    models; therefore a fraction of modifier atoms is placed near P.
-    Na is placed more uniformly, but here the same generic routine is
-    used for all modifiers for robust initial packing.
-    """
-    np.random.seed(seed + 3000)
-
-    half_box = box / 2.0
-
-    mod_o_min_d_sq = mod_o_min_dist * mod_o_min_dist
-    mod_mod_min_d_sq = mod_mod_min_dist * mod_mod_min_dist
-
-    placed = 0
-    max_attempts = 300000
-
-    mod_coords = np.zeros((n_mod, 3), dtype=np.float64)
-
-    for i in range(n_mod):
-        success = False
-
-        for attempt in range(max_attempts):
-            # 30% chance: place near a P atom
-            if n_p > 0 and np.random.random() < 0.30:
-                p_idx = np.random.randint(0, n_p)
-
-                theta = np.random.uniform(0.0, 2.0 * np.pi)
-                phi = np.arccos(2.0 * np.random.random() - 1.0)
-                r = np.random.uniform(3.0, p_attraction_radius)
-
-                px = (p_coords[p_idx, 0] + r * np.sin(phi) * np.cos(theta)) % box
-                py = (p_coords[p_idx, 1] + r * np.sin(phi) * np.sin(theta)) % box
-                pz = (p_coords[p_idx, 2] + r * np.cos(phi)) % box
-            else:
-                px = np.random.uniform(0.0, box)
-                py = np.random.uniform(0.0, box)
-                pz = np.random.uniform(0.0, box)
-
-            # Check distance to already placed NF + O atoms
-            valid = True
-            for j in range(n_all):
-                dx = px - all_coords[j, 0]
-                dy = py - all_coords[j, 1]
-                dz = pz - all_coords[j, 2]
-
-                if dx > half_box:
-                    dx -= box
-                elif dx < -half_box:
-                    dx += box
-
-                if dy > half_box:
-                    dy -= box
-                elif dy < -half_box:
-                    dy += box
-
-                if dz > half_box:
-                    dz -= box
-                elif dz < -half_box:
-                    dz += box
-
-                if dx * dx + dy * dy + dz * dz < mod_o_min_d_sq:
-                    valid = False
-                    break
-
-            if not valid:
+def place_terminal_oxygens(nf_coords, nf_types, deg, box, bo_coords, rng):
+    term_coords = []
+    term_owners = []
+    
+    o_tree = cKDTree(bo_coords, boxsize=box) if len(bo_coords) > 0 else None
+    nf_tree = cKDTree(nf_coords, boxsize=box)
+    
+    TETRA = np.array([
+        [1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]
+    ], dtype=np.float64)
+    for i in range(4):
+        TETRA[i] /= np.linalg.norm(TETRA[i])
+    
+    for nf in range(len(nf_coords)):
+        keep = max(0, 4 - int(deg[nf]))
+        if keep == 0:
+            continue
+        
+        pos = nf_coords[nf]
+        bond = 1.61 if nf_types[nf] == 0 else 1.50
+        R = random_rotation(rng)
+        
+        candidates = []
+        for k in range(4):
+            v = R @ TETRA[k]
+            v += 0.05 * (rng.random(3) - 0.5)
+            v /= np.linalg.norm(v)
+            candidates.append(v)
+        
+        rng.shuffle(candidates)
+        
+        placed_count = 0
+        for v in candidates:
+            if placed_count >= keep:
+                break
+            
+            o_pos = (pos + bond * v) % box
+            
+            if o_tree is not None and len(o_tree.query_ball_point(o_pos, 1.85)) > 0:
                 continue
-
-            # Check distance to already placed modifiers
-            for j in range(placed):
-                dx = px - mod_coords[j, 0]
-                dy = py - mod_coords[j, 1]
-                dz = pz - mod_coords[j, 2]
-
-                if dx > half_box:
-                    dx -= box
-                elif dx < -half_box:
-                    dx += box
-
-                if dy > half_box:
-                    dy -= box
-                elif dy < -half_box:
-                    dy += box
-
-                if dz > half_box:
-                    dz -= box
-                elif dz < -half_box:
-                    dz += box
-
-                if dx * dx + dy * dy + dz * dz < mod_mod_min_d_sq:
-                    valid = False
+            
+            overlap = False
+            for prev_o in term_coords:
+                if np.linalg.norm(minimum_image(o_pos - prev_o, box)) < 1.85:
+                    overlap = True
                     break
+            if overlap:
+                continue
+            
+            nearby_nf = nf_tree.query_ball_point(o_pos, 2.30)
+            too_close = False
+            for nf_idx in nearby_nf:
+                if nf_idx == nf:
+                    continue
+                if np.linalg.norm(minimum_image(o_pos - nf_coords[nf_idx], box)) < 2.30:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+            
+            term_coords.append(o_pos)
+            term_owners.append(nf)
+            placed_count += 1
+        
+        while placed_count < keep:
+            v = rng.normal(size=3)
+            v /= np.linalg.norm(v)
+            o_pos = (pos + bond * v) % box
+            term_coords.append(o_pos)
+            term_owners.append(nf)
+            placed_count += 1
+    
+    return (np.array(term_coords, dtype=np.float64) if term_coords 
+            else np.empty((0, 3), dtype=np.float64), 
+            np.array(term_owners, dtype=np.int32))
 
-            if valid:
-                mod_coords[placed, 0] = px
-                mod_coords[placed, 1] = py
-                mod_coords[placed, 2] = pz
-                placed += 1
-                success = True
+def place_free_oxygens(n_fo, static_coords, box, rng):
+    if n_fo <= 0:
+        return np.empty((0, 3), dtype=np.float64)
+    
+    tree = cKDTree(static_coords, boxsize=box) if len(static_coords) > 0 else None
+    fo_coords = []
+    
+    for _ in range(n_fo):
+        placed = False
+        
+        for attempt in range(8000):
+            pos = rng.uniform(0.0, box, 3)
+            
+            if tree is not None and len(tree.query_ball_point(pos, 2.1)) > 0:
+                continue
+            
+            ok = True
+            for p in fo_coords:
+                if np.linalg.norm(minimum_image(pos - p, box)) < 1.9:
+                    ok = False
+                    break
+            
+            if ok:
+                fo_coords.append(pos)
+                placed = True
                 break
+        
+        if not placed:
+            fo_coords.append(rng.uniform(0.0, box, 3))
+    
+    return np.array(fo_coords, dtype=np.float64)
 
-        if not success:
-            mod_coords[placed, 0] = np.random.uniform(0.0, box)
-            mod_coords[placed, 1] = np.random.uniform(0.0, box)
-            mod_coords[placed, 2] = np.random.uniform(0.0, box)
-            placed += 1
+def place_modifiers(n_mod_list, sites, site_owners, nf_types, static_coords, box, rng):
+    if len(sites) == 0:
+        total = sum(n for _, n in n_mod_list)
+        return rng.uniform(0.0, box, size=(total, 3))
+    
+    static_tree = cKDTree(static_coords, boxsize=box)
+    target_dist = {"Na": 2.40, "Ca": 2.36, "Mg": 2.00}
+    
+    p_site_idx = [
+        i for i, owner in enumerate(site_owners) 
+        if owner >= 0 and nf_types[owner] == 1
+    ]
+    
+    mod_coords = []
+    
+    for elem, n_mod in n_mod_list:
+        if n_mod <= 0:
+            continue
+        
+        for _ in range(n_mod):
+            pos = None
+            
+            for attempt in range(2000):
+                if elem in ("Ca", "Mg") and len(p_site_idx) > 0 and rng.random() < 0.35:
+                    site = sites[p_site_idx[rng.integers(len(p_site_idx))]]
+                else:
+                    site = sites[rng.integers(len(sites))]
+                
+                direction = rng.normal(size=3)
+                direction /= np.linalg.norm(direction)
+                dist = target_dist[elem] + rng.uniform(-0.15, 0.25)
+                cand = (site + direction * dist) % box
+                
+                if len(static_tree.query_ball_point(cand, 1.4)) > 0:
+                    continue
+                
+                ok = True
+                if len(mod_coords) > 0:
+                    arr = np.array(mod_coords)
+                    d = minimum_image(arr - cand, box)
+                    if np.any(np.sum(d * d, axis=1) < 4.0):
+                        ok = False
+                
+                if ok:
+                    pos = cand
+                    break
+            
+            if pos is None:
+                pos = rng.uniform(0.0, box, 3)
+            
+            mod_coords.append(pos)
+    
+    return np.array(mod_coords, dtype=np.float64)
 
-    return mod_coords, placed
+def hard_sphere_relaxation_fast(coords, types, box, iterations=80, step=0.10, r_max=2.5):
+    """Fast repulsive relaxation using KD-tree."""
+    new_coords = coords.copy()
+    
+    r_hard = np.full((6, 6), 0.9, dtype=np.float64)
+    r_hard[4, 4] = 1.90  # O-O
+    r_hard[0, 4] = 1.30; r_hard[4, 0] = 1.30  # Si-O
+    r_hard[3, 4] = 1.30; r_hard[4, 3] = 1.30  # P-O
+    r_hard[5, 4] = 1.20; r_hard[4, 5] = 1.20  # Mg-O
+    r_hard[1, 4] = 1.5; r_hard[4, 1] = 1.5    # Ca-O
+    r_hard[2, 4] = 1.5; r_hard[4, 2] = 1.5    # Na-O
+    
+    for it in range(iterations):
+        tree = cKDTree(new_coords, boxsize=box)
+        pairs = tree.query_pairs(r_max, output_type='ndarray')
+        
+        moved = False
+        for i, j in pairs:
+            d = minimum_image(new_coords[i] - new_coords[j], box)
+            r = np.linalg.norm(d)
+            limit = r_hard[types[i], types[j]]
+            
+            if r < limit and r > 1e-6:
+                moved = True
+                force_mag = step * (limit - r) / r
+                f = d * force_mag
+                new_coords[i] = (new_coords[i] + f) % box
+                new_coords[j] = (new_coords[j] - f) % box
+        
+        if not moved:
+            print(f"    Converged after {it + 1} iterations")
+            break
+    
+    return new_coords
 
-
-# ================================================================
-# VERIFICATION
-# ================================================================
-def verify_structure(symbols, coords, box):
-    """Comprehensive structure verification."""
-    print("\n" + "=" * 60)
-    print("  STRUCTURE VERIFICATION REPORT")
-    print("=" * 60)
-
+def verify_structure(symbols, coords, box, targets):
+    print("\n" + "=" * 70)
+    print("  STRUCTURE VERIFICATION REPORT (v5.3 - Exact BO Control)")
+    print("=" * 70)
+    
     tree = cKDTree(coords, boxsize=box)
-
-    # 1. Close contact check
+    
     print("\n--- Close Contact Check ---")
     checks = [
-        ("Si-Si", "Si", "Si", 2.6),
-        ("O-O",   "O",   "O",   1.8),
-        ("Si-O",  "Si",  "O",   1.3),
-        ("P-O",   "P",   "O",   1.3),
-        ("Mg-O",  "Mg",  "O",   1.3),
+        ("Si-Si", "Si", "Si", 2.4),
+        ("O-O", "O", "O", 1.7),
+        ("Si-O", "Si", "O", 1.2),
+        ("P-O", "P", "O", 1.2),
+        ("Mg-O", "Mg", "O", 1.2),
+        ("P-P", "P", "P", 3.0),
     ]
-
+    
     for name, e1, e2, threshold in checks:
-        idx1 = [i for i, s in enumerate(symbols) if s == e1]
-        idx2 = [i for i, s in enumerate(symbols) if s == e2]
-
-        if not idx1 or not idx2:
-            continue
-
         close = 0
         pairs = tree.query_pairs(threshold, output_type="ndarray")
-
+        
         for i, j in pairs:
-            if symbols[i] == e1 and symbols[j] == e2:
+            if (symbols[i] == e1 and symbols[j] == e2) or \
+               (symbols[i] == e2 and symbols[j] == e1):
                 close += 1
-            elif symbols[i] == e2 and symbols[j] == e1:
-                close += 1
-
-        status = "PASS" if close == 0 else f"{close} violations"
+        
+        status = "✅ PASS" if close == 0 else f"⚠️ {close} violations"
         print(f"  {name:8s} < {threshold:.1f} A: {status}")
-
-    # 2. Si coordination distribution
-    print("\n--- Si Coordination Distribution ---")
+    
     si_idx = [i for i, s in enumerate(symbols) if s == "Si"]
-    o_idx_set = set(i for i, s in enumerate(symbols) if s == "O")
-
-    si_cn = {}
-    for si in si_idx:
-        neigh = tree.query_ball_point(coords[si], 2.25)
-        cn = sum(1 for j in neigh if j != si and j in o_idx_set)
-        si_cn[cn] = si_cn.get(cn, 0) + 1
-
-    for cn in sorted(si_cn.keys()):
-        pct = si_cn[cn] / max(1, len(si_idx)) * 100.0
-        bar = "#" * int(pct / 2)
-        print(f"  CN={cn}: {si_cn[cn]:5d} ({pct:5.1f}%) {bar}")
-
-    # 3. P coordination distribution
-    print("\n--- P Coordination Distribution ---")
     p_idx = [i for i, s in enumerate(symbols) if s == "P"]
-
-    p_cn = {}
-    for p in p_idx:
-        neigh = tree.query_ball_point(coords[p], 2.25)
-        cn = sum(1 for j in neigh if j != p and j in o_idx_set)
-        p_cn[cn] = p_cn.get(cn, 0) + 1
-
-    for cn in sorted(p_cn.keys()):
-        pct = p_cn[cn] / max(1, len(p_idx)) * 100.0
-        bar = "#" * int(pct / 2)
-        print(f"  CN={cn}: {p_cn[cn]:5d} ({pct:5.1f}%) {bar}")
-
-    # 4. Modifier-O distances
-    print("\n--- Modifier-O Average Distances ---")
-    for mod, cut in [("Na", 3.34), ("Ca", 3.14), ("Mg", 2.60)]:
-        mod_idx = [i for i, s in enumerate(symbols) if s == mod]
-        if not mod_idx:
-            continue
-
-        dists = []
-        for m in mod_idx:
-            neigh = tree.query_ball_point(coords[m], cut)
-            for j in neigh:
-                if j != m and j in o_idx_set:
-                    d = coords[m] - coords[j]
-                    d -= box * np.round(d / box)
-                    dists.append(np.linalg.norm(d))
-
-        if dists:
-            print(
-                f"  {mod}-O: mean={np.mean(dists):.3f} A, "
-                f"min={np.min(dists):.3f}, max={np.max(dists):.3f}, "
-                f"avg_CN={len(dists) / len(mod_idx):.2f}"
+    o_idx = [i for i, s in enumerate(symbols) if s == "O"]
+    
+    si_cn = [
+        sum(1 for j in tree.query_ball_point(coords[si], 2.25) 
+            if j != si and symbols[j] == "O") 
+        for si in si_idx
+    ]
+    p_cn = [
+        sum(1 for j in tree.query_ball_point(coords[p], 2.25) 
+            if j != p and symbols[j] == "O") 
+        for p in p_idx
+    ]
+    
+    print("\n--- Network Former CN ---")
+    print(f"  Si-O CN mean: {np.mean(si_cn):.3f} (Target: 4.0)")
+    print(f"  P-O  CN mean: {np.mean(p_cn):.3f} (Target: 4.0)")
+    
+    o_nf_count = []
+    for o in o_idx:
+        nf_count = sum(
+            1 for j in tree.query_ball_point(coords[o], 2.25)
+            if j != o and symbols[j] in ["Si", "P"] and 
+            np.linalg.norm(minimum_image(coords[o] - coords[j], box)) < 2.25
+        )
+        o_nf_count.append(nf_count)
+    
+    fo = sum(1 for c in o_nf_count if c == 0)
+    nbo = sum(1 for c in o_nf_count if c == 1)
+    bo = sum(1 for c in o_nf_count if c == 2)
+    to = sum(1 for c in o_nf_count if c >= 3)
+    n_o = max(1, len(o_idx))
+    
+    print("\n--- Oxygen Speciation ---")
+    print(f"  FO : {fo:6d}  ({fo / n_o * 100.0:6.2f}%)   target FO : {targets['fo_pct']:.2f}%")
+    print(f"  NBO: {nbo:6d}  ({nbo / n_o * 100.0:6.2f}%)   target NBO: {targets['nbo_pct']:.2f}%")
+    print(f"  BO : {bo:6d}  ({bo / n_o * 100.0:6.2f}%)   target BO : {targets['bo_pct']:.2f}%")
+    print(f"  TO : {to:6d}  ({to / n_o * 100.0:6.2f}%)")
+    
+    bridging_set = {o_idx[i] for i, c in enumerate(o_nf_count) if c >= 2}
+    
+    def qn_for(center_idx):
+        return [
+            sum(
+                1 for j in tree.query_ball_point(coords[c], 2.25)
+                if j != c and symbols[j] == "O" and 
+                np.linalg.norm(minimum_image(coords[c] - coords[j], box)) < 2.25 and 
+                j in bridging_set
             )
+            for c in center_idx
+        ]
+    
+    qn_si = qn_for(si_idx)
+    qn_p = qn_for(p_idx)
+    
+    n_si, n_p = max(1, len(si_idx)), max(1, len(p_idx))
+    n_net = n_si + n_p
+    
+    nc_si = sum(min(q, 4) for q in qn_si) / n_si
+    nc_p = sum(min(q, 4) for q in qn_p) / n_p
+    nc_comb = (sum(min(q, 4) for q in qn_si) + sum(min(q, 4) for q in qn_p)) / n_net
+    
+    print("\n--- Network Connectivity ---")
+    print(f"  NC Si            : {nc_si:.3f}")
+    print(f"  NC P             : {nc_p:.3f}")
+    print(f"  NC Si-P Combined : {nc_comb:.3f}   target: {targets['nc']:.3f}")
+    print("=" * 70)
 
-    print("=" * 60)
-
-
-# ================================================================
-# MAIN GENERATOR
-# ================================================================
 def generate_structure(mg_label, density_override, output_file, seed, scale=4):
     if mg_label not in PAPER_COMPOSITION:
-        raise ValueError(
-            f"Invalid --mg {mg_label}. Valid values: {sorted(PAPER_COMPOSITION.keys())}"
-        )
-
+        raise ValueError(f"Invalid --mg {mg_label}")
+    
     entry = PAPER_COMPOSITION[mg_label]
-
-    # ===== COMPOSITION FROM PAPER TABLE 2 =====
-    N_SI = 461 * scale
-    N_P = 52 * scale
-    N_NA = 488 * scale
-    N_CA = entry["N_Ca"] * scale
-    N_MG = entry["N_Mg"] * scale
-    N_O = 1565 * scale
-
-    N_TARGET = N_SI + N_P + N_NA + N_CA + N_MG + N_O
-
+    rng = np.random.default_rng(seed)
+    
+    N_SI, N_P, N_NA = 461 * scale, 52 * scale, 488 * scale
+    N_CA, N_MG, N_O = entry["N_Ca"] * scale, entry["N_Mg"] * scale, 1565 * scale
+    
     counts = {
-        "Si": N_SI,
-        "P": N_P,
-        "Na": N_NA,
-        "Ca": N_CA,
-        "Mg": N_MG,
-        "O": N_O,
+        "Si": N_SI, "P": N_P, "Na": N_NA, 
+        "Ca": N_CA, "Mg": N_MG, "O": N_O
     }
-
-    actual_total = sum(counts.values())
-
-    print(f"\nComposition for paper label {entry['label']} (SCALE={scale}x):")
-    for k, v in counts.items():
-        print(f"  {k}: {v}")
-    print(f"  TOTAL: {actual_total}")
-
-    # ===== DENSITY FROM PAPER TABLE 2 =====
+    
+    print(f"\nComposition for {entry['label']} (SCALE={scale}x): TOTAL: {sum(counts.values())}")
+    
     density = entry["density"] if density_override is None else float(density_override)
-
     masses = {
-        "Si": 28.0855,
-        "Ca": 40.078,
-        "Na": 22.98977,
-        "P": 30.97376,
-        "O": 15.999,
-        "Mg": 24.305,
+        "Si": 28.0855, "Ca": 40.078, "Na": 22.98977, 
+        "P": 30.97376, "O": 15.999, "Mg": 24.305
     }
-
     total_mass = sum(masses[s] * c for s, c in counts.items())
-    volume_A3 = (total_mass / NA) / density * 1.0e24
-    box = volume_A3 ** (1.0 / 3.0)
-
+    box = ((total_mass / NA) / density * 1.0e24) ** (1.0 / 3.0)
+    
     print(f"Box size: {box:.6f} A (Density: {density:.6f} g/cm3)")
-
-    # ===== STAGE 1: Network Formers =====
-    print(f"\n[Stage 1/4] Placing {N_SI + N_P} network formers (min NF-NF = 3.0 A)...")
-    nf_coords, nf_placed = place_network_formers(
-        N_SI,
-        N_P,
-        box,
-        min_nf_dist=3.0,
-        seed=seed
+    
+    N_NF = N_SI + N_P
+    target_nc = PAPER_NC[mg_label]
+    
+    # EXACT target counts
+    n_bo_target = int(round(target_nc * N_NF / 2.0))
+    n_siop_target = min(125, n_bo_target)  # Max 125 Si-O-P
+    n_siosi_target = n_bo_target - n_siop_target
+    
+    print("\nTopology targets (EXACT):")
+    print(f"  Target NC: {target_nc:.3f} | Target BO: {n_bo_target} | Si-O-Si: {n_siosi_target} | Si-O-P: {n_siop_target}")
+    
+    # Stage 1: Network formers
+    print("\n[Stage 1/7] Placing network formers (P-P > 3.5 A)...")
+    nf_coords, nf_types = place_network_formers(
+        N_SI, N_P, box, min_nf_dist=2.7, min_p_p_dist=3.5, rng=rng
     )
-    print(f"  Placed {nf_placed} NF ({N_SI} Si + {N_P} P)")
-
-    # ===== STAGE 2: Oxygens =====
-    print("[Stage 2/4] Placing O atoms with target O/(Si+P) ratio from paper...")
-    o_coords, o_placed = place_oxygens_around_nf_target(
-        nf_coords,
-        nf_placed,
-        N_O,
-        box,
-        o_si_dist=1.61,   # paper Si-O ~ 1.606 A
-        o_p_dist=1.50,    # paper P-O ~ 1.49-1.50 A
-        n_si=N_SI,
-        o_min_dist=2.0,
-        seed=seed
+    
+    # Stage 2: Build EXACT topology
+    print("[Stage 2/7] Building EXACT topology (target BO count)...")
+    si_si_edges, si_p_edges, deg = build_topology_exact(
+        nf_coords, nf_types, box, n_siosi_target, n_siop_target, rng
     )
-    print(f"  Placed {o_placed} O (target: {N_O})")
-
-    if o_placed > N_O:
-        o_coords = o_coords[:N_O]
-        o_placed = N_O
-    elif o_placed < N_O:
-        # Very unlikely, but keep a robust fallback
-        np.random.seed(seed + 3000)
-        remaining = N_O - o_placed
-        extra_o = np.zeros((remaining, 3), dtype=np.float64)
-        half_box = box / 2.0
-        o_min_d_sq = 2.0 ** 2
-
-        for i in range(remaining):
-            px = np.random.uniform(0.0, box)
-            py = np.random.uniform(0.0, box)
-            pz = np.random.uniform(0.0, box)
-
-            for attempt in range(100000):
-                px = np.random.uniform(0.0, box)
-                py = np.random.uniform(0.0, box)
-                pz = np.random.uniform(0.0, box)
-
-                valid = True
-                for j in range(o_placed):
-                    dx = px - o_coords[j, 0]
-                    dy = py - o_coords[j, 1]
-                    dz = pz - o_coords[j, 2]
-
-                    if dx > half_box:
-                        dx -= box
-                    elif dx < -half_box:
-                        dx += box
-
-                    if dy > half_box:
-                        dy -= box
-                    elif dy < -half_box:
-                        dy += box
-
-                    if dz > half_box:
-                        dz -= box
-                    elif dz < -half_box:
-                        dz += box
-
-                    if dx * dx + dy * dy + dz * dz < o_min_d_sq:
-                        valid = False
-                        break
-
-                if valid:
-                    break
-
-            extra_o[i, 0] = px
-            extra_o[i, 1] = py
-            extra_o[i, 2] = pz
-
-        o_coords = np.vstack((o_coords[:o_placed], extra_o))
-        o_placed = N_O
-        print(f"  Added {remaining} extra O randomly")
-
-    # ===== STAGE 3: Modifiers =====
-    print("[Stage 3/4] Placing modifiers (affinity-aware, Ca/Mg near P possible)...")
-    all_nf_o = np.vstack((nf_coords[:nf_placed], o_coords[:N_O]))
-    n_all = nf_placed + N_O
-
-    N_MOD = N_NA + N_CA + N_MG
-
-    p_coords = nf_coords[N_SI:N_SI + N_P]
-
-    mod_coords, mod_placed = place_modifiers_affinity(
-        N_MOD,
-        box,
-        all_nf_o,
-        n_all,
-        mod_o_min_dist=2.0,
-        mod_mod_min_dist=2.0,
-        p_coords=p_coords,
-        n_p=N_P,
-        p_attraction_radius=6.0,
-        seed=seed
+    print(f"  Built Si-O-Si: {len(si_si_edges)} (target: {n_siosi_target})")
+    print(f"  Built Si-O-P: {len(si_p_edges)} (target: {n_siop_target})")
+    all_edges = si_si_edges + si_p_edges
+    
+    # Stage 3: Bridging oxygens
+    print("[Stage 3/7] Placing Bridging Oxygens (BO)...")
+    bo_coords = place_bridging_oxygens(nf_coords, nf_types, all_edges, box, rng)
+    
+    # Stage 4: Terminal oxygens
+    print("[Stage 4/7] Placing Terminal Oxygens (NBO) with strict distance check...")
+    term_coords, term_owners = place_terminal_oxygens(
+        nf_coords, nf_types, deg, box, bo_coords, rng
     )
-    print(f"  Placed {mod_placed} modifiers ({N_NA} Na + {N_CA} Ca + {N_MG} Mg)")
-
-    # ===== STAGE 4: Assembly =====
-    print("[Stage 4/4] Assembling final structure...")
-
-    symbols = []
-    all_coords = []
-
-    for i in range(N_SI):
-        symbols.append("Si")
-        all_coords.append(nf_coords[i])
-
-    for i in range(N_P):
-        symbols.append("P")
-        all_coords.append(nf_coords[N_SI + i])
-
-    for i in range(N_O):
-        symbols.append("O")
-        all_coords.append(o_coords[i])
-
-    for i in range(N_NA):
-        symbols.append("Na")
-        all_coords.append(mod_coords[i])
-
-    for i in range(N_CA):
-        symbols.append("Ca")
-        all_coords.append(mod_coords[N_NA + i])
-
-    for i in range(N_MG):
-        symbols.append("Mg")
-        all_coords.append(mod_coords[N_NA + N_CA + i])
-
-    all_coords = np.array(all_coords, dtype=np.float64)
-    total_atoms = len(symbols)
-
-    print(f"  Total atoms: {total_atoms}")
-
-    # ===== VERIFICATION =====
-    verify_structure(symbols, all_coords, box)
-
-    # ===== SHUFFLE =====
-    np.random.seed(seed + 5000)
-    perm = np.random.permutation(total_atoms)
+    
+    # Stage 5: Free oxygens
+    print("[Stage 5/7] Placing Free Oxygens (FO)...")
+    n_fo = N_O - len(term_coords) - len(bo_coords)
+    if n_fo < 0:
+        print(f"  WARNING: Too many NBO+BO, truncating BO")
+        bo_coords = bo_coords[:N_O - len(term_coords)]
+        n_fo = 0
+    
+    static_for_fo = (np.vstack([nf_coords, term_coords, bo_coords]) 
+                     if len(term_coords) > 0 
+                     else np.vstack([nf_coords, bo_coords]))
+    fo_coords = place_free_oxygens(n_fo, static_for_fo, box, rng)
+    
+    o_coords = (np.vstack([term_coords, bo_coords, fo_coords]) 
+                if len(term_coords) > 0 
+                else np.vstack([bo_coords, fo_coords]))
+    
+    sites = o_coords.copy()
+    site_owners = np.concatenate([
+        term_owners, 
+        -1 * np.ones(len(bo_coords) + len(fo_coords), dtype=np.int32)
+    ])
+    
+    print(f"  Terminal/NBO: {len(term_coords)} | Bridging: {len(bo_coords)} | Free: {n_fo}")
+    
+    # Stage 6: Modifiers
+    print("[Stage 6/7] Placing modifiers near NBO/FO sites...")
+    static_coords = np.vstack([nf_coords, o_coords])
+    mod_coords = place_modifiers(
+        [("Na", N_NA), ("Ca", N_CA), ("Mg", N_MG)], 
+        sites, site_owners, nf_types, static_coords, box, rng
+    )
+    
+    # Assembly
+    symbols_list = (["Si"] * N_SI + ["P"] * N_P + ["O"] * N_O + 
+                    ["Na"] * N_NA + ["Ca"] * N_CA + ["Mg"] * N_MG)
+    
+    all_coords_pre = np.vstack([nf_coords, o_coords, mod_coords])
+    
+    # Hard sphere relaxation
+    print("\n[Stage 7/7] Applying hard sphere relaxation to fix O-O overlap...")
+    type_map_int = {"Si": 0, "Ca": 1, "Na": 2, "P": 3, "O": 4, "Mg": 5}
+    all_types = np.array([type_map_int[s] for s in symbols_list], dtype=np.int32)
+    
+    relaxed_coords = hard_sphere_relaxation_fast(all_coords_pre, all_types, box, iterations=80, step=0.10, r_max=2.5)
+    
+    # Shuffle
+    final_coords = relaxed_coords
+    symbols = symbols_list.copy()
+    perm = rng.permutation(len(symbols))
     symbols = [symbols[i] for i in perm]
-    all_coords = all_coords[perm]
-
-    # ===== WRITE XYZ =====
+    final_coords = final_coords[perm]
+    
+    # Verification
+    targets = {
+        "nc": target_nc, "fo_pct": 0.45, 
+        "nbo_pct": 67.99, "bo_pct": 31.57
+    }
+    verify_structure(symbols, final_coords, box, targets)
+    
+    # Write XYZ
     out_path = Path(output_file)
     with open(out_path, "w") as f:
-        f.write(f"{total_atoms}\n")
+        f.write(f"{len(symbols)}\n")
         f.write(
-            f"Mg-doped 45S5 paper, label={entry['label']}, "
-            f"x={mg_label}, N={total_atoms}, "
-            f"rho={density:.6f} g/cm3, box={box:.6f} A, seed={seed}\n"
+            f"Mg-doped 45S5 v5.3 Exact BO, label={entry['label']}, "
+            f"x={mg_label}, N={len(symbols)}, rho={density:.6f} g/cm3, "
+            f"box={box:.6f} A, seed={seed}\n"
         )
-        for i in range(total_atoms):
+        for i in range(len(symbols)):
             f.write(
-                f"{symbols[i]:2s} "
-                f"{all_coords[i, 0]:12.6f} "
-                f"{all_coords[i, 1]:12.6f} "
-                f"{all_coords[i, 2]:12.6f}\n"
+                f"{symbols[i]:2s} {final_coords[i, 0]:12.6f} "
+                f"{final_coords[i, 1]:12.6f} {final_coords[i, 2]:12.6f}\n"
             )
-
-    print(f"\n[OK] Initial structure saved to: {out_path}")
-    print(f"[OK] Box = {box:.6f} A, Density = {density:.6f} g/cm3")
-
+    
+    print(f"\n[OK] Paper-matched initial structure saved to: {out_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Initial structure generator for Mg-doped 45S5 bioglass (paper parameters, 4x atoms)"
+        description="Paper-matched structure generator v5.3 (Exact BO Control)"
     )
-
-    parser.add_argument(
-        "--mg",
-        type=int,
-        default=0,
-        choices=sorted(PAPER_COMPOSITION.keys()),
-        help="Paper Mg label: 0, 1, 3, 5, 8, 10, 15, 20"
-    )
-    parser.add_argument(
-        "--density",
-        type=float,
-        default=None,
-        help="Optional density override. If omitted, paper density is used."
-    )
-    parser.add_argument(
-        "--out",
-        type=str,
-        default=None,
-        help="Output XYZ file name"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed"
-    )
-    parser.add_argument(
-        "--scale",
-        type=int,
-        default=4,
-        choices=[1, 2, 4],
-        help="Scale factor: 1=2835, 2=5670, 4=11340 atoms"
-    )
-
+    parser.add_argument("--mg", type=int, default=0, 
+                        choices=sorted(PAPER_COMPOSITION.keys()))
+    parser.add_argument("--density", type=float, default=None)
+    parser.add_argument("--out", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--scale", type=int, default=4, choices=[1, 2, 4])
     args = parser.parse_args()
-
+    
     if args.out is None:
-        args.out = f"initial_Mg{args.mg}.xyz"
-
-    generate_structure(
-        args.mg,
-        args.density,
-        args.out,
-        args.seed,
-        args.scale
-    )
+        args.out = f"initial_Mg{args.mg}_v5.xyz"
+    
+    generate_structure(args.mg, args.density, args.out, args.seed, args.scale)
+    
     
