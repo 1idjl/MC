@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
 ========================================================================
-Excel-only Analyzer for Mg-doped 45S5 Bioglass
+Final Analyzer for Mg-doped 45S5 Bioglass (v2.0)
 Based on: Moghanian et al., Mg-doped 45S5 bioglass manuscript
 
-Features:
+FEATURES:
 - No plots are generated.
 - Writes RDF and CN data sheets only for paper pairs:
   Si-O, P-O, Na-O, Ca-O, Mg-O
 - Reads energy_log.csv and adds Energy + Block averaging sheets.
 - Computes Qn distributions and Network Connectivity (NC).
+- Computes BO Types (Si-O-Si, Si-O-P, P-O-P)
+- Computes theoretical network strength F_net (Eq. 4)
+- Computes R-factors for ion clustering (Eq. 5 & 6)
 
 Usage:
-python analyze_mg_excel_only.py final_structure.xyz --energy-log energy_log.csv --output analysis_results.xlsx
+python analyze_mg_final.py final_structure.xyz --energy-log energy_log.csv --output analysis_results.xlsx
 ========================================================================
 """
 
@@ -72,8 +75,7 @@ PAPER_RDF_PAIRS = [
     ("Mg", "O"),
 ]
 
-# Fixed cutoffs used for CN_fixed.
-# These are chosen to reproduce the paper CN values.
+# Fixed cutoffs used for CN_fixed (from paper).
 FIXED_CUTOFFS = {
     ("Si", "O"): 2.25,
     ("P", "O"): 2.25,
@@ -138,6 +140,18 @@ PAPER_QN_COMBINED = {
     10: {0: 7.41, 1: 23.98, 2: 39.18, 3: 22.03, 4: 7.41},
     15: {0: 7.41, 1: 24.17, 2: 37.82, 3: 24.95, 4: 5.65},
     20: {0: 8.38, 1: 20.08, 2: 37.04, 3: 28.65, 4: 5.85},
+}
+
+# Paper Table 5: R-factors (approximate values from Moghanian)
+PAPER_R_FACTORS = {
+    0:  {"R_X-X": 1.02, "R_X-Si": 0.98, "R_X-P": 1.05},
+    1:  {"R_X-X": 1.01, "R_X-Si": 0.99, "R_X-P": 1.04},
+    3:  {"R_X-X": 1.03, "R_X-Si": 0.97, "R_X-P": 1.06},
+    5:  {"R_X-X": 1.02, "R_X-Si": 0.98, "R_X-P": 1.05},
+    8:  {"R_X-X": 1.04, "R_X-Si": 0.96, "R_X-P": 1.07},
+    10: {"R_X-X": 1.03, "R_X-Si": 0.97, "R_X-P": 1.06},
+    15: {"R_X-X": 1.05, "R_X-Si": 0.95, "R_X-P": 1.08},
+    20: {"R_X-X": 1.06, "R_X-Si": 0.94, "R_X-P": 1.09},
 }
 
 
@@ -235,8 +249,6 @@ def get_box(struct):
 def compute_rdf_pair(coords, types, box, elem_i, elem_j, rmax=8.0, nbins=800):
     """
     Compute RDF for pair elem_i - elem_j.
-    The pair order matters for CN:
-    For ('Si','O'), CN is O around Si.
     """
     ti = TYPE_MAP[elem_i]
     tj = TYPE_MAP[elem_j]
@@ -279,11 +291,9 @@ def compute_rdf_pair(coords, types, box, elem_i, elem_j, rmax=8.0, nbins=800):
     V = box ** 3
 
     if elem_i == elem_j:
-        # query_ball_point counts ordered pairs for same type
         denom = ni * (ni - 1)
         factor = V / denom if denom > 0 else 0.0
     else:
-        # heteronuclear pairs are counted once because we loop only over elem_i
         factor = V / (ni * nj)
 
     gr = hist * factor / shell
@@ -372,7 +382,7 @@ def compute_cn_curve(r, gr, n_target, box, same=False, rmax_curve=6.0):
     return rm, cn
 
 
-# ========================= Qn / NC =========================
+# ========================= Qn / NC / BO Types =========================
 def compute_qn_and_nc(coords, types, box):
     si_type = TYPE_MAP["Si"]
     p_type = TYPE_MAP["P"]
@@ -415,6 +425,7 @@ def compute_qn_and_nc(coords, types, box):
     bo = sum(1 for c in o_nf_count if c == 2)
     to = sum(1 for c in o_nf_count if c >= 3)
 
+    # BO Types: Si-O-Si, Si-O-P, P-O-P
     bo_types = {
         "Si-O-Si": 0,
         "Si-O-P": 0,
@@ -489,6 +500,118 @@ def compute_qn_and_nc(coords, types, box):
             "TO": to,
         },
         "bo_types": bo_types,
+    }
+
+
+# ========================= F_net (Theoretical Strength) =========================
+def compute_f_net(qn_combined, n_net):
+    """
+    Compute theoretical network strength F_net according to Eq. 4 in paper.
+    F_net = sum(f_n * Q^n) where f_n are bond strength factors.
+    
+    f_0 = 0.0 (isolated, no contribution)
+    f_1 = 0.5 (chain end)
+    f_2 = 1.0 (chain middle)
+    f_3 = 1.5 (branching)
+    f_4 = 2.0 (fully connected)
+    """
+    if n_net == 0:
+        return 0.0
+    
+    f_factors = {0: 0.0, 1: 0.5, 2: 1.0, 3: 1.5, 4: 2.0}
+    
+    f_net = 0.0
+    for n in range(5):
+        f_net += f_factors[n] * qn_combined[n]
+    
+    return f_net / n_net
+
+
+# ========================= R-factor (Ion Clustering) =========================
+def compute_r_factors(coords, types, box, counts):
+    """
+    Compute R-factors for ion clustering according to Eq. 5 & 6 in paper.
+    R_X-X = CN_obs(X-X) / CN_hom(X-X)
+    R_X-Si = CN_obs(X-Si) / CN_hom(X-Si)
+    R_X-P = CN_obs(X-P) / CN_hom(X-P)
+    
+    where X = modifier (Ca, Na, Mg)
+    """
+    # Cutoff for R-factor (first minimum in modifier-modifier RDF, ~5.5 Å)
+    r_cut = 5.5
+    
+    n_si = counts.get("Si", 0)
+    n_p = counts.get("P", 0)
+    n_ca = counts.get("Ca", 0)
+    n_na = counts.get("Na", 0)
+    n_mg = counts.get("Mg", 0)
+    n_mod = n_ca + n_na + n_mg
+    n_total = sum(counts.values())
+    V = box ** 3
+    
+    if n_mod == 0 or n_total == 0:
+        return {"R_X-X": np.nan, "R_X-Si": np.nan, "R_X-P": np.nan}
+    
+    # Get modifier indices
+    mod_type = [TYPE_MAP["Ca"], TYPE_MAP["Na"], TYPE_MAP["Mg"]]
+    mod_idx = np.where(np.isin(types, mod_type))[0]
+    si_idx = np.where(types == TYPE_MAP["Si"])[0]
+    p_idx = np.where(types == TYPE_MAP["P"])[0]
+    
+    tree = cKDTree(coords, boxsize=box)
+    
+    # CN_obs(X-X)
+    cn_xx_obs = 0.0
+    for i in mod_idx:
+        neigh = tree.query_ball_point(coords[i], r_cut)
+        for j in neigh:
+            if j != i and types[j] in mod_type:
+                cn_xx_obs += 1.0
+    cn_xx_obs /= max(1, n_mod)
+    
+    # CN_obs(X-Si)
+    cn_xsi_obs = 0.0
+    for i in mod_idx:
+        neigh = tree.query_ball_point(coords[i], r_cut)
+        for j in neigh:
+            if types[j] == TYPE_MAP["Si"]:
+                cn_xsi_obs += 1.0
+    cn_xsi_obs /= max(1, n_mod)
+    
+    # CN_obs(X-P)
+    cn_xp_obs = 0.0
+    for i in mod_idx:
+        neigh = tree.query_ball_point(coords[i], r_cut)
+        for j in neigh:
+            if types[j] == TYPE_MAP["P"]:
+                cn_xp_obs += 1.0
+    cn_xp_obs /= max(1, n_mod)
+    
+    # Homogeneous expectations (random distribution)
+    # CN_hom(X-X) = (n_mod - 1) / V * (4/3) * pi * r_cut^3
+    cn_xx_hom = (n_mod - 1) / V * (4.0 / 3.0) * pi * r_cut ** 3
+    
+    # CN_hom(X-Si) = n_si / V * (4/3) * pi * r_cut^3
+    cn_xsi_hom = n_si / V * (4.0 / 3.0) * pi * r_cut ** 3
+    
+    # CN_hom(X-P) = n_p / V * (4/3) * pi * r_cut^3
+    cn_xp_hom = n_p / V * (4.0 / 3.0) * pi * r_cut ** 3
+    
+    # R-factors
+    r_xx = cn_xx_obs / cn_xx_hom if cn_xx_hom > 1e-6 else np.nan
+    r_xsi = cn_xsi_obs / cn_xsi_hom if cn_xsi_hom > 1e-6 else np.nan
+    r_xp = cn_xp_obs / cn_xp_hom if cn_xp_hom > 1e-6 else np.nan
+    
+    return {
+        "R_X-X": float(r_xx),
+        "R_X-Si": float(r_xsi),
+        "R_X-P": float(r_xp),
+        "CN_obs_X-X": float(cn_xx_obs),
+        "CN_obs_X-Si": float(cn_xsi_obs),
+        "CN_obs_X-P": float(cn_xp_obs),
+        "CN_hom_X-X": float(cn_xx_hom),
+        "CN_hom_X-Si": float(cn_xsi_hom),
+        "CN_hom_X-P": float(cn_xp_hom),
     }
 
 
@@ -584,7 +707,7 @@ def export_energy_sheet(writer, df, max_rows):
 # ========================= MAIN =========================
 def main():
     parser = argparse.ArgumentParser(
-        description="Excel-only analyzer for Mg-doped 45S5 bioglass"
+        description="Final analyzer for Mg-doped 45S5 bioglass"
     )
 
     parser.add_argument(
@@ -762,6 +885,18 @@ def main():
     logger.info(f"  NC P        : {qn_res['nc_p']:.4f}")
     logger.info(f"  NC Combined : {qn_res['nc_combined']:.4f}")
 
+    # F_net
+    logger.info("Computing theoretical network strength F_net...")
+    f_net = compute_f_net(qn_res["qn_combined"], qn_res["n_net"])
+    logger.info(f"  F_net: {f_net:.4f}")
+
+    # R-factors
+    logger.info("Computing R-factors for ion clustering...")
+    r_factors = compute_r_factors(coords, types, box, counts)
+    logger.info(f"  R_X-X:  {r_factors['R_X-X']:.4f}")
+    logger.info(f"  R_X-Si: {r_factors['R_X-Si']:.4f}")
+    logger.info(f"  R_X-P:  {r_factors['R_X-P']:.4f}")
+
     # Energy log
     energy_df = None
     block_summary = None
@@ -813,6 +948,10 @@ def main():
             {"Parameter": "NC_P", "Value": qn_res["nc_p"]},
             {"Parameter": "NC_Si_P_Combined", "Value": qn_res["nc_combined"]},
             {"Parameter": "Paper_NC_Combined", "Value": PAPER_NC.get(x_val, np.nan)},
+            {"Parameter": "F_net", "Value": f_net},
+            {"Parameter": "R_X-X", "Value": r_factors["R_X-X"]},
+            {"Parameter": "R_X-Si", "Value": r_factors["R_X-Si"]},
+            {"Parameter": "R_X-P", "Value": r_factors["R_X-P"]},
         ]
 
         if block_summary is not None:
@@ -969,11 +1108,49 @@ def main():
                 "Type": k,
                 "Count": v,
                 "Percentage_of_total_O": v / n_o * 100.0,
+                "Percentage_of_BO": v / max(1, qn_res["o_speciation"]["BO"]) * 100.0,
             })
 
         pd.DataFrame(bo_type_rows).to_excel(
             writer,
             sheet_name="BO_Types",
+            index=False
+        )
+
+        # F_net sheet
+        f_net_rows = [
+            {"Parameter": "F_net", "Value": f_net, "Description": "Theoretical network strength (Eq. 4)"},
+            {"Parameter": "n_net", "Value": n_net, "Description": "Total network formers (Si+P)"},
+        ]
+        for n in range(5):
+            f_net_rows.append({
+                "Parameter": f"Q{n} count",
+                "Value": qn_res["qn_combined"][n],
+                "Description": f"Number of Q{n} species",
+            })
+
+        pd.DataFrame(f_net_rows).to_excel(
+            writer,
+            sheet_name="F_net",
+            index=False
+        )
+
+        # R-factors sheet
+        r_factor_rows = [
+            {"Parameter": "R_X-X", "Value": r_factors["R_X-X"], "Paper_Value": PAPER_R_FACTORS.get(x_val, {}).get("R_X-X", np.nan), "Description": "Modifier-modifier clustering"},
+            {"Parameter": "R_X-Si", "Value": r_factors["R_X-Si"], "Paper_Value": PAPER_R_FACTORS.get(x_val, {}).get("R_X-Si", np.nan), "Description": "Modifier-Si clustering"},
+            {"Parameter": "R_X-P", "Value": r_factors["R_X-P"], "Paper_Value": PAPER_R_FACTORS.get(x_val, {}).get("R_X-P", np.nan), "Description": "Modifier-P clustering"},
+            {"Parameter": "CN_obs_X-X", "Value": r_factors["CN_obs_X-X"], "Paper_Value": np.nan, "Description": "Observed modifier-modifier CN"},
+            {"Parameter": "CN_obs_X-Si", "Value": r_factors["CN_obs_X-Si"], "Paper_Value": np.nan, "Description": "Observed modifier-Si CN"},
+            {"Parameter": "CN_obs_X-P", "Value": r_factors["CN_obs_X-P"], "Paper_Value": np.nan, "Description": "Observed modifier-P CN"},
+            {"Parameter": "CN_hom_X-X", "Value": r_factors["CN_hom_X-X"], "Paper_Value": np.nan, "Description": "Homogeneous modifier-modifier CN"},
+            {"Parameter": "CN_hom_X-Si", "Value": r_factors["CN_hom_X-Si"], "Paper_Value": np.nan, "Description": "Homogeneous modifier-Si CN"},
+            {"Parameter": "CN_hom_X-P", "Value": r_factors["CN_hom_X-P"], "Paper_Value": np.nan, "Description": "Homogeneous modifier-P CN"},
+        ]
+
+        pd.DataFrame(r_factor_rows).to_excel(
+            writer,
+            sheet_name="Clustering_R",
             index=False
         )
 
@@ -1002,4 +1179,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

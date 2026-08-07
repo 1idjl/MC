@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
 ========================================================================
-45S5/Mg Bioglass NVT Monte Carlo - FINAL VERSION
+45S5/Mg Bioglass NVT Monte Carlo - ENHANCED VERSION v2.0
 Based on: Moghanian et al., Mg-doped 45S5 bioglass manuscript
 
-FEATURES:
-- Identity Swap moves for cation equilibration
-- Optimized annealing schedule
-- Block averaging with standard error
-- Energy logging with decomposition
-- Production-ready for publication
+IMPROVEMENTS over v1.0:
+1. Identity Swap enabled in Production (critical for cation equilibration)
+2. Automatic snapshot saving every N sweeps
+3. Restart capability from checkpoint files
+4. Enhanced progress bar with ETA
+5. Better error handling and recovery
 
 Usage:
   python simulation_mg_final.py initial_Mg5.xyz --final-sweeps 50000
+  python simulation_mg_final.py initial_Mg5.xyz --continue  # Resume from checkpoint
 ========================================================================
 """
 
@@ -23,6 +24,7 @@ import re
 import warnings
 import codecs
 import argparse
+import json
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from pathlib import Path
@@ -30,6 +32,7 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 from numba import njit
 from math import erfc, exp, sqrt, pi
+import time
 
 warnings.filterwarnings('ignore')
 
@@ -115,7 +118,7 @@ class SimulationConfig:
     low_t_sweeps: int = 8
     
     final_sweeps: int = 50000
-    snapshot_interval: Optional[int] = None
+    snapshot_interval: int = 5000  # Save snapshot every 5000 sweeps
     max_snapshots: int = 50
     
     cutoff: float = 12.0
@@ -130,6 +133,8 @@ class SimulationConfig:
     swap_move_freq: int = 100
     
     block_size: int = 5000
+    
+    checkpoint_interval: int = 10000  # Save checkpoint every 10000 steps
     
     def __post_init__(self):
         if self.output_dir is None:
@@ -608,9 +613,17 @@ class MCSimulator:
             else max(5000, N)
         )
         
+        self.snapshot_interval_steps = config.snapshot_interval * N
+        self.checkpoint_interval_steps = config.checkpoint_interval
+        
         self._prepare_matrices()
         self._init_energy()
         self._build_cation_lists()
+        
+        # Try to load checkpoint if continuing
+        self.start_step = 0
+        if config.continue_mode:
+            self._load_checkpoint()
         
         logger.info(
             f"MC schedule: mixing={self.mixing_steps}, "
@@ -619,6 +632,8 @@ class MCSimulator:
             f"production={self.final_steps}"
         )
         logger.info(f"Identity Swap frequency: every {config.swap_move_freq} steps")
+        logger.info(f"Snapshot interval: every {config.snapshot_interval} sweeps")
+        logger.info(f"Checkpoint interval: every {config.checkpoint_interval} steps")
     
     def _build_cation_lists(self):
         self.na_indices = np.where(
@@ -703,6 +718,96 @@ class MCSimulator:
             self.energy_log.append(self.current_energy / self.system.N_ATOMS)
             self.short_log.append(self.current_short / self.system.N_ATOMS)
             self.coul_log.append(self.current_coul / self.system.N_ATOMS)
+    
+    def _save_snapshot(self, sweep_num):
+        """Save structure snapshot."""
+        snapshot_dir = self.config.output_dir / "snapshots"
+        snapshot_dir.mkdir(exist_ok=True)
+        
+        snapshot_path = snapshot_dir / f"snapshot_{sweep_num:06d}.xyz"
+        with open(snapshot_path, 'w') as f:
+            f.write(f"{self.system.N_ATOMS}\n")
+            f.write(
+                f"Snapshot at sweep {sweep_num}, "
+                f"step={self.step}, energy={self.current_energy/self.system.N_ATOMS:.6f} eV/atom\n"
+            )
+            for i in range(self.system.N_ATOMS):
+                elem = self.system.type_to_elem[self.system.type_indices[i]]
+                x_, y_, z_ = self.system.coords[i]
+                f.write(f"{elem:2s} {x_:12.6f} {y_:12.6f} {z_:12.6f}\n")
+        
+        logger.info(f"Snapshot saved: {snapshot_path.name}")
+    
+    def _save_checkpoint(self):
+        """Save checkpoint for restart capability."""
+        checkpoint_path = self.config.output_dir / "checkpoint.json"
+        
+        checkpoint_data = {
+            'step': self.step,
+            'accepted': self.accepted,
+            'attempts': self.attempts,
+            'swap_attempts': self.swap_attempts,
+            'swap_accepted': self.swap_accepted,
+            'current_energy': self.current_energy,
+            'current_short': self.current_short,
+            'current_coul': self.current_coul,
+            'max_disp': self.max_disp,
+            'rebuilds': self.rebuilds,
+        }
+        
+        with open(checkpoint_path, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        
+        # Save coordinates
+        coords_path = self.config.output_dir / "checkpoint_coords.npy"
+        np.save(coords_path, self.system.coords)
+        
+        # Save types
+        types_path = self.config.output_dir / "checkpoint_types.npy"
+        np.save(types_path, self.system.type_indices)
+        
+        # Save charges
+        charges_path = self.config.output_dir / "checkpoint_charges.npy"
+        np.save(charges_path, self.system.charges)
+    
+    def _load_checkpoint(self):
+        """Load checkpoint to resume simulation."""
+        checkpoint_path = self.config.output_dir / "checkpoint.json"
+        coords_path = self.config.output_dir / "checkpoint_coords.npy"
+        types_path = self.config.output_dir / "checkpoint_types.npy"
+        charges_path = self.config.output_dir / "checkpoint_charges.npy"
+        
+        if not checkpoint_path.exists():
+            logger.warning("No checkpoint found, starting from beginning")
+            return
+        
+        try:
+            with open(checkpoint_path, 'r') as f:
+                checkpoint_data = json.load(f)
+            
+            self.start_step = checkpoint_data['step']
+            self.accepted = checkpoint_data['accepted']
+            self.attempts = checkpoint_data['attempts']
+            self.swap_attempts = checkpoint_data['swap_attempts']
+            self.swap_accepted = checkpoint_data['swap_accepted']
+            self.current_energy = checkpoint_data['current_energy']
+            self.current_short = checkpoint_data['current_short']
+            self.current_coul = checkpoint_data['current_coul']
+            self.max_disp = checkpoint_data['max_disp']
+            self.rebuilds = checkpoint_data['rebuilds']
+            self.step = self.start_step
+            
+            self.system.coords = np.load(coords_path)
+            self.system.type_indices = np.load(types_path)
+            self.system.charges = np.load(charges_path)
+            
+            logger.info(f"Resumed from checkpoint at step {self.start_step}")
+            logger.info(f"Current energy: {self.current_energy / self.system.N_ATOMS:.6f} eV/atom")
+        
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            logger.warning("Starting from beginning")
+            self.start_step = 0
     
     def _mc_move(self, T: float) -> bool:
         n = self.system.N_ATOMS
@@ -890,6 +995,11 @@ class MCSimulator:
         pbar = tqdm(range(steps), desc=f"T={T:.0f}K")
         
         for step_in_stage in pbar:
+            if self.step < self.start_step:
+                self.step += 1
+                pbar.update(1)
+                continue
+            
             self.step += 1
             self.attempts += 1
             stage_att += 1
@@ -905,6 +1015,15 @@ class MCSimulator:
                 window_acc += 1
             
             self._maybe_log()
+            
+            # Save checkpoint periodically
+            if self.step % self.checkpoint_interval_steps == 0:
+                self._save_checkpoint()
+            
+            # Save snapshot periodically
+            if self.step % self.snapshot_interval_steps == 0:
+                sweep_num = self.step // self.system.N_ATOMS
+                self._save_snapshot(sweep_num)
             
             if adaptive and (self.step % self.tune_freq == 0):
                 ca = window_acc / max(1, window_att)
@@ -941,33 +1060,14 @@ class MCSimulator:
         logger.info("=" * 70)
         logger.info(f"STARTING NVT MONTE CARLO - Mg label 45-M{self.config.x}")
         if self.config.continue_mode:
-            logger.info("MODE: CONTINUE (Skipping mixing/annealing)")
+            logger.info("MODE: CONTINUE (Resuming from checkpoint)")
         logger.info("=" * 70)
         
-        if self.config.continue_mode:
-            self._run_stage(
-                2500.0,
-                max(1, int(3 * self.system.N_ATOMS)),
-                "Short Healing",
-                adaptive=True,
-                enhance_oxygen=True
-            )
-            self._run_stage(
-                1500.0,
-                max(1, int(2 * self.system.N_ATOMS)),
-                "Cool down 1",
-                adaptive=True
-            )
-            self._run_stage(
-                800.0,
-                max(1, int(2 * self.system.N_ATOMS)),
-                "Cool down 2",
-                adaptive=True
-            )
-            for k in self.max_disp:
-                self.max_disp[k] *= 0.5
-            self._run_stage(1.0, self.low_t_steps, "Low-T relaxation")
+        if self.config.continue_mode and self.start_step > 0:
+            # Resume from where we left off - skip directly to production
+            logger.info(f"Resuming from step {self.start_step}, skipping to production")
         else:
+            # Full protocol
             self._run_stage(
                 self.config.mixing_temp,
                 self.mixing_steps,
@@ -1017,27 +1117,62 @@ class MCSimulator:
             
             self._run_stage(1.0, self.low_t_steps, "Low-T relaxation")
         
-        # PRODUCTION
+        # PRODUCTION - CRITICAL: Enable Identity Swap here!
         for k in self.max_disp:
             self.max_disp[k] = min(max(self.max_disp[k] * 0.8, 0.02), 0.15)
         
         logger.info(f"Production: T=300 K, steps={self.final_steps}")
+        logger.info("Identity Swap ENABLED in production for cation equilibration")
+        
+        start_time = time.time()
         pbar = tqdm(range(self.final_steps), desc="T=300K")
         
         for s in pbar:
+            if self.step < self.start_step:
+                self.step += 1
+                pbar.update(1)
+                continue
+            
             self.step += 1
             self.attempts += 1
+            
+            # CRITICAL FIX: Enable Identity Swap in Production!
+            if s % self.config.swap_move_freq == 0:
+                self._swap_move(300.0)
             
             if self._mc_move(300.0):
                 self.accepted += 1
             
             self._maybe_log()
             
-            pbar.set_postfix(
-                {'acc': f'{self.accepted / max(1, self.attempts) * 100:.1f}%'}
-            )
+            # Save checkpoint periodically
+            if self.step % self.checkpoint_interval_steps == 0:
+                self._save_checkpoint()
+            
+            # Save snapshot periodically
+            if self.step % self.snapshot_interval_steps == 0:
+                sweep_num = self.step // self.system.N_ATOMS
+                self._save_snapshot(sweep_num)
+            
+            # Enhanced progress bar with ETA
+            elapsed = time.time() - start_time
+            if s > 0:
+                rate = s / elapsed
+                eta = (self.final_steps - s) / rate
+                eta_str = f"ETA: {eta/3600:.1f}h"
+            else:
+                eta_str = ""
+            
+            pbar.set_postfix({
+                'acc': f'{self.accepted / max(1, self.attempts) * 100:.1f}%',
+                'swap': f'{self.swap_accepted}/{self.swap_attempts}',
+                'eta': eta_str
+            })
         
         pbar.close()
+        
+        # Final checkpoint
+        self._save_checkpoint()
         
         logger.info("=" * 70)
         logger.info("SIMULATION COMPLETED")
@@ -1049,7 +1184,8 @@ class MCSimulator:
         )
         logger.info(
             f"Swap moves: attempts={self.swap_attempts}, "
-            f"accepted={self.swap_accepted}"
+            f"accepted={self.swap_accepted} "
+            f"({self.swap_accepted / max(1, self.swap_attempts) * 100:.2f}%)"
         )
 
 # ========================= BLOCK AVERAGING =========================
@@ -1086,7 +1222,7 @@ def compute_block_energy(energy_log, block_size=5000):
 # ========================= MAIN =========================
 def main():
     parser = argparse.ArgumentParser(
-        description="45S5/Mg Bioglass NVT Monte Carlo - FINAL VERSION"
+        description="45S5/Mg Bioglass NVT Monte Carlo - ENHANCED VERSION v2.0"
     )
     parser.add_argument(
         'input_file',
@@ -1127,7 +1263,19 @@ def main():
         '--continue',
         dest='continue_mode',
         action='store_true',
-        help='Skip mixing/annealing. Use for relaxing pre-equilibrated structure.'
+        help='Resume from checkpoint if available.'
+    )
+    parser.add_argument(
+        '--snapshot-interval',
+        type=int,
+        default=5000,
+        help='Save snapshot every N sweeps (default: 5000)'
+    )
+    parser.add_argument(
+        '--checkpoint-interval',
+        type=int,
+        default=10000,
+        help='Save checkpoint every N steps (default: 10000)'
     )
     
     args = parser.parse_args()
@@ -1152,6 +1300,8 @@ def main():
             cutoff=args.cutoff,
             wolf_alpha=args.wolf_alpha,
             continue_mode=args.continue_mode,
+            snapshot_interval=args.snapshot_interval,
+            checkpoint_interval=args.checkpoint_interval,
         )
         
         if args.final_sweeps is not None:
@@ -1229,5 +1379,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-    
