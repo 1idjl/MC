@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
 ========================================================================
-45S5/Mg Bioglass NVT Monte Carlo - ENHANCED VERSION v2.0
+45S5/Mg Bioglass NVT Monte Carlo - OPTIMIZED VERSION v3.0
 Based on: Moghanian et al., Mg-doped 45S5 bioglass manuscript
 
-IMPROVEMENTS over v1.0:
-1. Identity Swap enabled in Production (critical for cation equilibration)
-2. Automatic snapshot saving every N sweeps
-3. Restart capability from checkpoint files
-4. Enhanced progress bar with ETA
-5. Better error handling and recovery
+v3.0 IMPROVEMENTS:
+1. Optimized annealing schedule with longer dwell at 2500-1500 K
+   (critical for breaking artificial BO bonds)
+2. Increased mixing sweeps (20 -> 30) for better initial homogenization
+3. Increased healing sweeps (5 -> 10) for final defect removal
+4. Identity Swap enabled in Production (cation equilibration)
+5. Automatic checkpoint saving for resume capability
+6. Snapshot saving for trajectory analysis
 
 Usage:
-  python simulation_mg_final.py initial_Mg5.xyz --final-sweeps 50000
-  python simulation_mg_final.py initial_Mg5.xyz --continue  # Resume from checkpoint
+  python simulation_mg.py initial_Mg0.xyz --final-sweeps 20000
+  python simulation_mg.py initial_Mg0.xyz --continue  # Resume from checkpoint
 ========================================================================
 """
 
@@ -25,6 +27,7 @@ import warnings
 import codecs
 import argparse
 import json
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from pathlib import Path
@@ -32,7 +35,6 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 from numba import njit
 from math import erfc, exp, sqrt, pi
-import time
 
 warnings.filterwarnings('ignore')
 
@@ -105,19 +107,33 @@ class SimulationConfig:
     continue_mode: bool = False
     
     mixing_temp: float = 5000.0
-    mixing_sweeps: int = 20
+    mixing_sweeps: int = 30  # ✅ Increased from 20 for better initial homogenization
     
+    # ✅ OPTIMIZED ANNEALING SCHEDULE:
+    # Longer dwell at 2500-1500 K to break artificial BO bonds
     annealing_sweeps: List[Tuple[float, int]] = field(default_factory=lambda: [
-        (4500, 4), (4000, 4), (3500, 4), (3000, 6), (2500, 6),
-        (2000, 6), (1500, 6), (1200, 8), (1000, 8), (800, 8),
-        (700, 8), (600, 6), (500, 5), (400, 5), (300, 5),
+        (4500, 6),
+        (4000, 6),
+        (3500, 8),
+        (3000, 12),   # Longer at high T
+        (2500, 20),   # ⭐ Critical temperature for topology rearrangement
+        (2000, 20),   # ⭐ Continue rearrangement
+        (1500, 15),   # ⭐ Structure stabilization
+        (1200, 10),
+        (1000, 10),
+        (800, 8),
+        (700, 8),
+        (600, 6),
+        (500, 5),
+        (400, 5),
+        (300, 5),
     ])
     
     healing_temp: float = 2500.0
-    healing_sweeps: int = 5
+    healing_sweeps: int = 10  # ✅ Increased from 5 for final defect removal
     low_t_sweeps: int = 8
     
-    final_sweeps: int = 50000
+    final_sweeps: int = 20000
     snapshot_interval: int = 5000  # Save snapshot every 5000 sweeps
     max_snapshots: int = 50
     
@@ -133,7 +149,6 @@ class SimulationConfig:
     swap_move_freq: int = 100
     
     block_size: int = 5000
-    
     checkpoint_interval: int = 10000  # Save checkpoint every 10000 steps
     
     def __post_init__(self):
@@ -260,7 +275,6 @@ class GlassSystem:
         self.coords = self.coords % self.box
     
     def _compute_charges(self):
-        # Partial charges from Moghanian et al.
         base = {
             'Si': 2.4, 'Ca': 1.2, 'Na': 0.6,
             'P': 3.0, 'O': -1.2, 'Mg': 1.2,
@@ -620,14 +634,15 @@ class MCSimulator:
         self._init_energy()
         self._build_cation_lists()
         
-        # Try to load checkpoint if continuing
+        # Load checkpoint if continuing
         self.start_step = 0
         if config.continue_mode:
             self._load_checkpoint()
         
+        total_annealing = sum(s for _, s in self.annealing_stages)
         logger.info(
             f"MC schedule: mixing={self.mixing_steps}, "
-            f"annealing={sum(s for _, s in self.annealing_stages)}, "
+            f"annealing={total_annealing}, "
             f"healing={self.healing_steps}, low-T={self.low_t_steps}, "
             f"production={self.final_steps}"
         )
@@ -758,15 +773,12 @@ class MCSimulator:
         with open(checkpoint_path, 'w') as f:
             json.dump(checkpoint_data, f, indent=2)
         
-        # Save coordinates
         coords_path = self.config.output_dir / "checkpoint_coords.npy"
         np.save(coords_path, self.system.coords)
         
-        # Save types
         types_path = self.config.output_dir / "checkpoint_types.npy"
         np.save(types_path, self.system.type_indices)
         
-        # Save charges
         charges_path = self.config.output_dir / "checkpoint_charges.npy"
         np.save(charges_path, self.system.charges)
     
@@ -1016,11 +1028,9 @@ class MCSimulator:
             
             self._maybe_log()
             
-            # Save checkpoint periodically
             if self.step % self.checkpoint_interval_steps == 0:
                 self._save_checkpoint()
             
-            # Save snapshot periodically
             if self.step % self.snapshot_interval_steps == 0:
                 sweep_num = self.step // self.system.N_ATOMS
                 self._save_snapshot(sweep_num)
@@ -1064,7 +1074,6 @@ class MCSimulator:
         logger.info("=" * 70)
         
         if self.config.continue_mode and self.start_step > 0:
-            # Resume from where we left off - skip directly to production
             logger.info(f"Resuming from step {self.start_step}, skipping to production")
         else:
             # Full protocol
@@ -1117,7 +1126,7 @@ class MCSimulator:
             
             self._run_stage(1.0, self.low_t_steps, "Low-T relaxation")
         
-        # PRODUCTION - CRITICAL: Enable Identity Swap here!
+        # PRODUCTION
         for k in self.max_disp:
             self.max_disp[k] = min(max(self.max_disp[k] * 0.8, 0.02), 0.15)
         
@@ -1136,7 +1145,6 @@ class MCSimulator:
             self.step += 1
             self.attempts += 1
             
-            # CRITICAL FIX: Enable Identity Swap in Production!
             if s % self.config.swap_move_freq == 0:
                 self._swap_move(300.0)
             
@@ -1145,16 +1153,13 @@ class MCSimulator:
             
             self._maybe_log()
             
-            # Save checkpoint periodically
             if self.step % self.checkpoint_interval_steps == 0:
                 self._save_checkpoint()
             
-            # Save snapshot periodically
             if self.step % self.snapshot_interval_steps == 0:
                 sweep_num = self.step // self.system.N_ATOMS
                 self._save_snapshot(sweep_num)
             
-            # Enhanced progress bar with ETA
             elapsed = time.time() - start_time
             if s > 0:
                 rate = s / elapsed
@@ -1171,7 +1176,6 @@ class MCSimulator:
         
         pbar.close()
         
-        # Final checkpoint
         self._save_checkpoint()
         
         logger.info("=" * 70)
@@ -1190,7 +1194,6 @@ class MCSimulator:
 
 # ========================= BLOCK AVERAGING =========================
 def compute_block_energy(energy_log, block_size=5000):
-    """Compute block-averaged energy with standard deviation."""
     if len(energy_log) < block_size * 3:
         return {
             'mean': float(np.mean(energy_log)) if energy_log else 0.0,
@@ -1222,12 +1225,12 @@ def compute_block_energy(energy_log, block_size=5000):
 # ========================= MAIN =========================
 def main():
     parser = argparse.ArgumentParser(
-        description="45S5/Mg Bioglass NVT Monte Carlo - ENHANCED VERSION v2.0"
+        description="45S5/Mg Bioglass NVT Monte Carlo - OPTIMIZED VERSION v3.0"
     )
     parser.add_argument(
         'input_file',
         type=Path,
-        help='Input XYZ file generated by structure_generator_paper_mg.py'
+        help='Input XYZ file generated by structure_generator.py'
     )
     parser.add_argument(
         '--seed',
@@ -1317,7 +1320,6 @@ def main():
         logger.info(f"Mode       : {'CONTINUE' if args.continue_mode else 'FULL PROTOCOL'}")
         logger.info(f"Output dir : {config.output_dir}")
         
-        # ---- SIMULATION ----
         system = GlassSystem(config)
         sim = MCSimulator(system, config)
         sim.run()
@@ -1328,14 +1330,13 @@ def main():
             'coul': sim.coul_log,
         }
         
-        # ---- BLOCK AVERAGING ----
         block_energy = compute_block_energy(sim.energy_log, config.block_size)
         logger.info(
             f"Block Energy: mean={block_energy['mean']:.6f}, "
             f"std={block_energy['std']:.6f}"
         )
         
-        # ---- SAVE FINAL STRUCTURE ----
+        # Save final structure
         xyz_path = config.output_dir / "final_structure.xyz"
         with open(xyz_path, 'w') as f:
             f.write(f"{system.N_ATOMS}\n")
@@ -1351,7 +1352,7 @@ def main():
                 f.write(f"{elem:2s} {x_:12.6f} {y_:12.6f} {z_:12.6f}\n")
         logger.info(f"Final XYZ saved to {xyz_path}")
         
-        # ---- SAVE ENERGY LOG ----
+        # Save energy log
         energy_path = config.output_dir / "energy_log.csv"
         with open(energy_path, 'w') as f:
             f.write("Step,Total_eV_per_atom,ShortRange_eV_per_atom,Coulomb_eV_per_atom\n")
@@ -1362,7 +1363,7 @@ def main():
                 f.write(f"{step},{e:.6f},{s:.6f},{c:.6f}\n")
         logger.info(f"Energy log saved to {energy_path}")
         
-        # ---- SAVE BLOCK AVERAGING ----
+        # Save block averaging
         block_path = config.output_dir / "block_averaging.txt"
         with open(block_path, 'w') as f:
             f.write(f"Block size: {config.block_size}\n")

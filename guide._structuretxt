@@ -17,3 +17,41 @@ python struture.py --sr 0 --density 2.649 --seed 42
 
 # 2. اجرای شبیه‌سازی
 python Sr.py initial_Sr0.xyz --final-sweeps 150 --cores 12
+آنالیز
+python analyze_final.py Bioglass_x0_N11340_seed42/final_structure.xyz
+
+
+
+# 1. تولید ساختار اولیه
+python struture.py --sr 0 --density 2.649 --seed 42
+
+# 2. شبیه‌سازی (بدون آنالیز)
+python Sr.py initial_Sr0.xyz --final-sweeps 150
+
+# 3. آنالیز جداگانه روی خروجی شبیه‌سازی
+python analyze.py Bioglass_x0_N11340_seed42/final_structure.xyz
+
+# 4. ادامه از ساختار قبلی + آنالیز
+python Sr.py Bioglass_x0_N11340_seed42/final_structure.xyz --continue --final-sweeps 300
+python analyze.py Bioglass_x0_N11340_seed42/final_structure.xyz --output-dir analysis_continued
+
+
+
+
+# تولید ساختار (45S5 خالص)
+python struture.py --sr 0 --density 2.649 --seed 42
+
+# تولید ساختار (Sr-doped)
+python struture.py --sr 5  --density 2.712 --seed 42
+python struture.py --sr 10 --density 2.791 --seed 42
+python struture.py --sr 15 --density 2.845 --seed 42
+
+# شبیه‌سازی
+python Sr.py initial_Sr0.xyz --final-sweeps 150 --cores 12
+
+final
+# شبیه‌سازی کامل + آنالیز
+python Sr.py initial_Sr0.xyz --final-sweeps 150 --cores 12
+
+# ادامه از ساختار قبلی + آنالیز
+python Sr.py Bioglass_x0_N11340_seed42/final_structure.xyz --continue --final-sweeps 300 --cores 12

@@ -693,3 +693,4 @@ if __name__ == "__main__":
         args.out = f"initial_Mg{args.mg}.xyz"
     
     generate_structure(args.mg, args.out, args.seed, args.scale)
+    
